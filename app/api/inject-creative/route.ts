@@ -146,73 +146,56 @@ export async function POST(request: NextRequest) {
 
     // --- Build the creative HTML ---
     const creativeHtml = buildCreativeHtml(creativeBase64, creativeMimeType, slot.width, slot.height);
+    const wrappedCreative = `<div style="position:relative;width:${slot.width}px;height:${slot.height}px;overflow:hidden;outline:3px solid #000;flex-shrink:0;">${creativeHtml}</div>`;
 
-    // --- Inject position-aware script at end of <body> ---
-    // This script runs in the iframe, measures actual element positions,
-    // finds the element closest to slot.x / slot.y, and injects the creative.
-    const injectionScript = `
-<script>
-(function() {
-  var targetX = ${slot.x};
-  var targetY = ${slot.y};
-  var selector = ${JSON.stringify(slot.selector)};
-  var creativeHtml = ${JSON.stringify(
-    `<div style="position:relative;width:100%;height:100%;overflow:hidden;outline:3px solid #000;">${creativeHtml}</div>`
-  )};
+    // --- Server-side injection: find slot element by selector, replace its contents ---
+    // JS is stripped so we must inject at parse time, not at runtime.
+    let injected = false;
 
-  function inject() {
-    var matches;
-    try {
-      matches = Array.from(document.querySelectorAll(selector));
-    } catch(e) {
-      matches = [];
-    }
-
-    // If selector matched nothing, try finding by IAB dimensions
-    if (matches.length === 0) {
-      var w = ${slot.width}, h = ${slot.height};
-      matches = Array.from(document.querySelectorAll('div,aside,section')).filter(function(el) {
-        var r = el.getBoundingClientRect();
-        return Math.abs(r.width - w) <= 12 && Math.abs(r.height - h) <= 12;
-      });
-    }
-
-    if (matches.length === 0) return;
-
-    // Pick the element closest to the recorded slot position
-    var best = null;
-    var bestDist = Infinity;
-    matches.forEach(function(el) {
-      var r = el.getBoundingClientRect();
-      var absTop = r.top + window.scrollY;
-      var absLeft = r.left + window.scrollX;
-      var dist = Math.abs(absLeft - targetX) + Math.abs(absTop - targetY);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = el;
+    // Try the recorded CSS selector first
+    if (slot.selector) {
+      try {
+        const matches = root.querySelectorAll(slot.selector);
+        if (matches.length > 0) {
+          const el = matches[0];
+          el.setAttribute('style',
+            `position:relative;overflow:hidden;width:${slot.width}px;height:${slot.height}px;` +
+            `max-width:${slot.width}px;max-height:${slot.height}px;display:block;flex-shrink:0;`
+          );
+          el.set_content(wrappedCreative);
+          injected = true;
+        }
+      } catch {
+        // invalid selector — fall through to dimension scan
       }
-    });
-
-    if (best) {
-      best.style.position = 'relative';
-      best.style.overflow = 'hidden';
-      best.innerHTML = creativeHtml;
     }
-  }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', inject);
-  } else {
-    inject();
-  }
-})();
-</script>`;
+    // Fallback: scan all divs/asides/sections for matching IAB dimensions
+    if (!injected) {
+      const candidates = root.querySelectorAll('div,aside,section,ins');
+      for (const el of candidates) {
+        const style = el.getAttribute('style') ?? '';
+        const widthMatch = style.match(/width\s*:\s*(\d+)px/);
+        const heightMatch = style.match(/height\s*:\s*(\d+)px/);
+        if (widthMatch && heightMatch) {
+          const w = parseInt(widthMatch[1], 10);
+          const h = parseInt(heightMatch[1], 10);
+          if (Math.abs(w - slot.width) <= 12 && Math.abs(h - slot.height) <= 12) {
+            el.setAttribute('style',
+              `position:relative;overflow:hidden;width:${slot.width}px;height:${slot.height}px;` +
+              `max-width:${slot.width}px;max-height:${slot.height}px;display:block;flex-shrink:0;`
+            );
+            el.set_content(wrappedCreative);
+            injected = true;
+            break;
+          }
+        }
+      }
+    }
 
-    const body2 = root.querySelector('body');
-    if (body2) {
-      body2.insertAdjacentHTML('beforeend', injectionScript);
-    } else {
-      root.insertAdjacentHTML('beforeend', injectionScript);
+    // If we couldn't find the slot element, surface a clear error
+    if (!injected) {
+      return NextResponse.json({ error: 'Could not locate the ad slot element in the page HTML.' }, { status: 422 });
     }
 
     const modifiedHTML = root.toString();
