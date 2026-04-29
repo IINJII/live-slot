@@ -154,16 +154,36 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
   useEffect(() => {
     if (!isOpen || !slot || !creative || !detection) return;
     setPreview(null); setPreviewError(null); setIsLoadingPreview(true);
-    fetch('/api/screenshot', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fileId: creative.fileId, slot,
-        screenshotBase64: detection.screenshotBase64,
-        pageWidth: detection.pageWidth,
-        pageHeight: detection.pageHeight,
-      }),
-    })
+
+    // Fetch the creative as base64 on the client, then send to screenshot API.
+    // This avoids the /tmp isolation problem on Vercel serverless functions.
+    fetch(creative.tempUrl)
+      .then(r => {
+        if (!r.ok) throw new Error('Could not fetch creative file.');
+        return r.blob();
+      })
+      .then(blob => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          // Strip the "data:<mime>;base64," prefix
+          resolve(dataUrl.split(',')[1]);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      }))
+      .then(creativeBase64 => fetch('/api/screenshot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creativeBase64,
+          creativeMimeType: creative.mimeType,
+          slot,
+          screenshotBase64: detection.screenshotBase64,
+          pageWidth: detection.pageWidth,
+          pageHeight: detection.pageHeight,
+        }),
+      }))
       .then(r => r.json())
       .then(data => { if (data.error) setPreviewError(data.error); else setPreview(data); })
       .catch(() => setPreviewError('Failed to generate preview.'))
