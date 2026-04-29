@@ -2,7 +2,7 @@ import { AdSlot } from '@/types';
 import { AD_SELECTORS, getIabName, IAB_SIZES, IAB_SIZE_TOLERANCE } from './adSelectors';
 import { v4 as uuidv4 } from 'uuid';
 import puppeteer from 'puppeteer-core';
-import chromium from './chromium';
+import chromium, { CHROMIUM_REMOTE_URL } from './chromium';
 
 export async function detectAdSlots(url: string): Promise<{
   slots: AdSlot[];
@@ -18,7 +18,9 @@ export async function detectAdSlots(url: string): Promise<{
     let args: string[];
 
     if (isVercel) {
-      executablePath = await chromium.executablePath();
+      // Pass remote URL so chromium downloads the binary to /tmp at runtime
+      // instead of looking for the local bin/ dir (which doesn't exist when bundled)
+      executablePath = await chromium.executablePath(CHROMIUM_REMOTE_URL);
       args = chromium.args;
     } else {
       // Local dev: try to use system Chrome
