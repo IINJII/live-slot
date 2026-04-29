@@ -133,17 +133,17 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
       .finally(() => setIsLoadingPreview(false));
   }, [isOpen, slot?.id, creative?.fileId, detection?.url]);
 
-  // Reset DOM preview when slot changes
-  useEffect(() => {
-    setDomHtml(null);
-    setDomError(null);
-  }, [slot?.id]);
-
-  // Load DOM-injected preview (lazy — only when DOM tab is active)
+  // Load DOM-injected preview (lazy — only when DOM tab is active).
+  // Keyed on slot.id so switching slots always re-fetches. Reset + fetch happen
+  // atomically in one effect to avoid a blank-screen render between the two.
   useEffect(() => {
     if (!isOpen || activeTab !== 'dom' || !slot || !creative || !detection) return;
-    if (domHtml || isLoadingDom) return;
-    setDomError(null); setIsLoadingDom(true);
+    // Always start fresh for this slot
+    setDomHtml(null);
+    setDomError(null);
+    setIsLoadingDom(true);
+
+    let cancelled = false;
 
     fetch(creative.tempUrl)
       .then(r => {
@@ -171,9 +171,11 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
         if (!r.ok) return r.json().then((d: { error?: string }) => { throw new Error(d.error ?? 'Injection failed'); });
         return r.text();
       })
-      .then(html => setDomHtml(html))
-      .catch(err => setDomError(err instanceof Error ? err.message : 'DOM preview failed.'))
-      .finally(() => setIsLoadingDom(false));
+      .then(html => { if (!cancelled) setDomHtml(html); })
+      .catch(err => { if (!cancelled) setDomError(err instanceof Error ? err.message : 'DOM preview failed.'); })
+      .finally(() => { if (!cancelled) setIsLoadingDom(false); });
+
+    return () => { cancelled = true; };
   }, [isOpen, activeTab, slot?.id, creative?.fileId, detection?.url]);
 
   if (!isOpen || !slot || !creative || !detection) return null;

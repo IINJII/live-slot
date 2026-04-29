@@ -86,8 +86,12 @@ export async function detectAdSlots(url: string): Promise<{
           width: number;
           height: number;
           selector: string;
+          selectorIndex: number;
           isVisible: boolean;
         }> = [];
+
+        // Track how many times we've emitted each selector so we know the nth index
+        const selectorCount: Record<string, number> = {};
 
         function processElement(el: Element, selector: string) {
           const rect = el.getBoundingClientRect();
@@ -111,12 +115,16 @@ export async function detectAdSlots(url: string): Promise<{
             style.visibility !== 'hidden' &&
             style.opacity !== '0';
 
+          const idx = selectorCount[selector] ?? 0;
+          selectorCount[selector] = idx + 1;
+
           results.push({
             x: Math.round(absX),
             y: Math.round(absY),
             width: Math.round(w),
             height: Math.round(h),
             selector,
+            selectorIndex: idx,
             isVisible,
           });
         }
@@ -174,6 +182,7 @@ export async function detectAdSlots(url: string): Promise<{
       label: `${getIabName(s.width, s.height)} ${s.width}×${s.height}`,
       iabName: getIabName(s.width, s.height),
       selector: s.selector,
+      selectorIndex: s.selectorIndex,
       isVisible: s.isVisible,
     }));
 

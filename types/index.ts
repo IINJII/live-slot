@@ -19,6 +19,7 @@ export interface AdSlot {
   height: number;
   label: string;
   selector: string;
+  selectorIndex: number;   // nth match of `selector` on the page (0-based)
   iabName: string;
   isVisible: boolean;
 }

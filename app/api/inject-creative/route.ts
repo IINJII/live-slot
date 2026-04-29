@@ -152,12 +152,13 @@ export async function POST(request: NextRequest) {
     // JS is stripped so we must inject at parse time, not at runtime.
     let injected = false;
 
-    // Try the recorded CSS selector first
+    // Try the recorded CSS selector first — use selectorIndex to pick the exact nth match
     if (slot.selector) {
       try {
         const matches = root.querySelectorAll(slot.selector);
-        if (matches.length > 0) {
-          const el = matches[0];
+        const idx = slot.selectorIndex ?? 0;
+        const el = matches[idx] ?? matches[0];
+        if (el) {
           el.setAttribute('style',
             `position:relative;overflow:hidden;width:${slot.width}px;height:${slot.height}px;` +
             `max-width:${slot.width}px;max-height:${slot.height}px;display:block;flex-shrink:0;`
