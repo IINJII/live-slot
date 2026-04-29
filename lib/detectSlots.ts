@@ -20,12 +20,15 @@ export async function detectAdSlots(url: string): Promise<{
     let executablePath: string;
 
     if (isVercel) {
-      const chromium = await import('@sparticuz/chromium');
-      puppeteer = await import('puppeteer-core');
+      // Dynamic import must not be statically analyzable — use variable indirection
+      const chromiumPkg = '@sparticuz/chromium';
+      const puppeteerPkg = 'puppeteer-core';
+      const chromium = await import(/* webpackIgnore: true */ chromiumPkg);
+      puppeteer = await import(/* webpackIgnore: true */ puppeteerPkg);
       executablePath = await chromium.default.executablePath();
     } else {
       // Local dev: try to use system Chrome
-      puppeteer = await import('puppeteer-core');
+      puppeteer = await import(/* webpackIgnore: true */ 'puppeteer-core');
       const possiblePaths = [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/usr/bin/google-chrome',
@@ -40,7 +43,7 @@ export async function detectAdSlots(url: string): Promise<{
     }
 
     const chromiumArgs = isVercel
-      ? (await import('@sparticuz/chromium')).default.args
+      ? (await import(/* webpackIgnore: true */ '@sparticuz/chromium')).default.args
       : ['--no-sandbox', '--disable-setuid-sandbox'];
 
     browser = await puppeteer.launch({

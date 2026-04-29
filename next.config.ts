@@ -5,6 +5,17 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: __dirname,
   },
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      config.externals = [
+        ...(Array.isArray(config.externals) ? config.externals : []),
+        '@sparticuz/chromium',
+        'puppeteer-core',
+        'sharp',
+      ];
+    }
+    return config;
+  },
 };
 
 export default nextConfig;
