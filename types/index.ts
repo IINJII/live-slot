@@ -29,6 +29,7 @@ export interface DetectionResult {
   screenshotBase64: string;
   pageWidth: number;
   pageHeight: number;
+  pageHTML: string;
   detectedAt: string;
 }
 

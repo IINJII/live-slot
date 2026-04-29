@@ -9,6 +9,7 @@ export async function detectAdSlots(url: string): Promise<{
   screenshotBase64: string;
   pageWidth: number;
   pageHeight: number;
+  pageHTML: string;
 }> {
   let browser = null;
 
@@ -160,6 +161,9 @@ export async function detectAdSlots(url: string): Promise<{
 
     const screenshotBase64 = Buffer.from(screenshotBuffer).toString('base64');
 
+    // Capture fully-rendered HTML (post-JS, ad slots present in DOM)
+    const pageHTML = await page.content();
+
     // Build AdSlot objects
     const slots: AdSlot[] = rawSlots.map((s) => ({
       id: uuidv4(),
@@ -181,6 +185,7 @@ export async function detectAdSlots(url: string): Promise<{
       screenshotBase64,
       pageWidth: pageMetrics.width,
       pageHeight: pageMetrics.height,
+      pageHTML,
     };
   } finally {
     if (browser) await browser.close();

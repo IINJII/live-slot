@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const { slots, screenshotBase64, pageWidth, pageHeight } = await detectAdSlots(url);
+    const { slots, screenshotBase64, pageWidth, pageHeight, pageHTML } = await detectAdSlots(url);
 
     const result: DetectionResult = {
       url,
@@ -45,6 +45,7 @@ export async function POST(request: NextRequest) {
       screenshotBase64,
       pageWidth,
       pageHeight,
+      pageHTML,
       detectedAt: new Date().toISOString(),
     };
 
