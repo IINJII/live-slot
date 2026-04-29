@@ -1,9 +1,9 @@
 {
   "functions": {
-    "app/api/detect-slots/route.ts": {
+    "api/detect-slots": {
       "maxDuration": 60
     },
-    "app/api/screenshot/route.ts": {
+    "api/screenshot": {
       "maxDuration": 60
     }
   }
