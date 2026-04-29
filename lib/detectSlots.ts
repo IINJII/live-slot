@@ -1,10 +1,8 @@
 import { AdSlot } from '@/types';
 import { AD_SELECTORS, getIabName, IAB_SIZES, IAB_SIZE_TOLERANCE } from './adSelectors';
 import { v4 as uuidv4 } from 'uuid';
-
-// Minimum size to consider an element as a potential ad slot
-const MIN_WIDTH = 50;
-const MIN_HEIGHT = 30;
+import puppeteer from 'puppeteer-core';
+import chromium from './chromium';
 
 export async function detectAdSlots(url: string): Promise<{
   slots: AdSlot[];
@@ -16,19 +14,14 @@ export async function detectAdSlots(url: string): Promise<{
 
   try {
     const isVercel = !!process.env.VERCEL;
-    let puppeteer: typeof import('puppeteer-core');
     let executablePath: string;
+    let args: string[];
 
     if (isVercel) {
-      // Dynamic import must not be statically analyzable — use variable indirection
-      const chromiumPkg = '@sparticuz/chromium';
-      const puppeteerPkg = 'puppeteer-core';
-      const chromium = await import(/* webpackIgnore: true */ chromiumPkg);
-      puppeteer = await import(/* webpackIgnore: true */ puppeteerPkg);
-      executablePath = await chromium.default.executablePath();
+      executablePath = await chromium.executablePath();
+      args = chromium.args;
     } else {
       // Local dev: try to use system Chrome
-      puppeteer = await import(/* webpackIgnore: true */ 'puppeteer-core');
       const possiblePaths = [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/usr/bin/google-chrome',
@@ -40,14 +33,11 @@ export async function detectAdSlots(url: string): Promise<{
       const found = possiblePaths.find((p) => fs.existsSync(p));
       if (!found) throw new Error('Chrome not found. Install Google Chrome for local development.');
       executablePath = found;
+      args = ['--no-sandbox', '--disable-setuid-sandbox'];
     }
 
-    const chromiumArgs = isVercel
-      ? (await import(/* webpackIgnore: true */ '@sparticuz/chromium')).default.args
-      : ['--no-sandbox', '--disable-setuid-sandbox'];
-
     browser = await puppeteer.launch({
-      args: chromiumArgs,
+      args,
       executablePath,
       headless: true,
     });
