@@ -6,6 +6,8 @@ interface SlotGridProps {
   slots: AdSlot[];
   onSelectSlot: (slot: AdSlot) => void;
   selectedSlotId?: string;
+  emptyMessage?: string;
+  emptySubMessage?: string;
 }
 
 function SlotVisual({ width, height }: { width: number; height: number }) {
@@ -21,25 +23,29 @@ function SlotVisual({ width, height }: { width: number; height: number }) {
   );
 }
 
-export default function SlotGrid({ slots, onSelectSlot, selectedSlotId }: SlotGridProps) {
+export default function SlotGrid({ slots, onSelectSlot, selectedSlotId, emptyMessage, emptySubMessage }: SlotGridProps) {
   if (slots.length === 0) {
     return (
       <div className="border border-[var(--line)] py-20 text-center">
-        <p className="font-serif text-2xl text-[var(--text-muted)] italic mb-2">No ad slots detected</p>
-        <p className="font-mono text-sm text-[var(--text-dim)]">Try a news or media website with display advertising.</p>
+        <p className="font-serif text-2xl text-[var(--text-muted)] italic mb-2">
+          {emptyMessage ?? 'No ad slots detected'}
+        </p>
+        <p className="font-mono text-sm text-[var(--text-dim)]">
+          {emptySubMessage ?? 'Try a news or media website with display advertising.'}
+        </p>
       </div>
     );
   }
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 border-t border-l border-black">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
       {slots.map((slot, i) => {
         const isSelected = selectedSlotId === slot.id;
         return (
           <button
             key={slot.id}
             onClick={() => onSelectSlot(slot)}
-            className="animate-slot-in group border-r border-b border-black p-6 text-left transition-colors hover:bg-black hover:text-white"
+            className="animate-slot-in group border border-[var(--line)] hover:border-black p-6 text-left transition-colors hover:bg-black hover:text-white"
             style={{
               animationDelay: `${i * 40}ms`,
               background: isSelected ? '#000' : '#fff',

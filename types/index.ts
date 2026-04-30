@@ -19,9 +19,11 @@ export interface AdSlot {
   height: number;
   label: string;
   selector: string;
-  selectorIndex: number;   // nth match of `selector` on the page (0-based)
+  selectorIndex: number;
   iabName: string;
   isVisible: boolean;
+  isFixed: boolean; // position:fixed — viewport coords never change with scroll
+  compositeBase64: string; // server-composited viewport screenshot with creative overlaid
 }
 
 export interface DetectionResult {

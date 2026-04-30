@@ -22,7 +22,7 @@ export const IAB_SIZES: { width: number; height: number; name: string }[] = [
 ];
 
 // Tolerance in pixels when matching dimensions to IAB sizes
-export const IAB_SIZE_TOLERANCE = 10;
+export const IAB_SIZE_TOLERANCE = 15;
 
 // CSS selectors that strongly indicate an ad slot
 export const AD_SELECTORS: string[] = [
@@ -69,14 +69,34 @@ export const AD_SELECTORS: string[] = [
   // Prebid / header bidding
   'div[id*="prebid"]',
   'div[id*="hb-ad"]',
-  // Common publisher naming patterns
-  'div[id*="leaderboard"]',
+  // Common publisher naming patterns (kept specific to avoid false positives on
+  // news/political sites where "leaderboard" and "banner" appear in content IDs)
   'div[id*="skyscraper"]',
   'div[id*="rectangle"]',
   'div[id*="mrec"]',
-  'div[id*="banner"]',
-  'div[class*="leaderboard"]',
+  'div[id*="leaderboard-ad"]',
+  'div[id*="ad-leaderboard"]',
+  'div[id*="banner-ad"]',
+  'div[id*="ad-banner"]',
   'div[class*="skyscraper"]',
+  // Mediavine
+  'div[id^="mv-target"]',
+  'div[id*="mv_slot"]',
+  'div[class*="mv-ad-box"]',
+  'div[id*="mediavine"]',
+  'div[class*="mediavine"]',
+  '[data-google-query-id]',
+  // CNN / WarnerMedia / news-publisher patterns
+  'div[class*="ad-slot__"]',
+  'div[class*="ads__"]',
+  'div[data-ad-position]',
+  'div[data-ad-name]',
+  'div[data-ad-unit-path]',
+  // Generic ad-container patterns
+  'div[class*="ad-container"]',
+  'div[class*="ad_container"]',
+  'div[class*="ad-wrapper"]',
+  'div[class*="ad_wrapper"]',
 ];
 
 export function getIabName(width: number, height: number): string {

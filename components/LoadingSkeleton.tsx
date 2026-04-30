@@ -1,6 +1,6 @@
 export function SlotCardSkeleton() {
   return (
-    <div className="border-r border-b border-black p-6">
+    <div className="border border-[var(--line)] p-6">
       <div className="shimmer w-11 h-11 mb-5" />
       <div className="shimmer h-3 w-20 mb-2" />
       <div className="shimmer h-8 w-32 mb-1" />
@@ -13,7 +13,7 @@ export function SlotCardSkeleton() {
 
 export function SlotGridSkeleton({ count = 6 }: { count?: number }) {
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 border-l border-t border-black">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
       {Array.from({ length: count }).map((_, i) => (
         <SlotCardSkeleton key={i} />
       ))}

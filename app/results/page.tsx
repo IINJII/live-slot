@@ -9,6 +9,17 @@ import { ScanningState, SlotGridSkeleton } from '@/components/LoadingSkeleton';
 
 type Step = 'scanning' | 'results' | 'error';
 
+const SLOT_TOLERANCE = 15;
+
+function filterCompatibleSlots(slots: AdSlot[], creative: Creative | null): AdSlot[] {
+  if (!creative || creative.width === 0 || creative.height === 0) return slots;
+  return slots.filter(
+    (s) =>
+      Math.abs(s.width - creative.width) <= SLOT_TOLERANCE &&
+      Math.abs(s.height - creative.height) <= SLOT_TOLERANCE
+  );
+}
+
 function CreativeThumb({ creative }: { creative: Creative }) {
   return (
     <div className="flex items-center gap-3 border border-[var(--line)] px-4 py-2.5">
@@ -37,6 +48,7 @@ function ResultsPageInner() {
 
   const fileId = searchParams.get('fileId') ?? '';
   const targetUrl = searchParams.get('url') ?? '';
+  const device = (searchParams.get('device') ?? 'desktop') as 'mobile' | 'tablet' | 'desktop';
 
   const [step, setStep] = useState<Step>('scanning');
   const [detection, setDetection] = useState<DetectionResult | null>(null);
@@ -67,11 +79,15 @@ function ResultsPageInner() {
       return;
     }
 
+    // Read creative dims directly from sessionStorage — creative state may not be set yet
+    const creativeWidth = Number(sessionStorage.getItem('ls_width') ?? 0);
+    const creativeHeight = Number(sessionStorage.getItem('ls_height') ?? 0);
+
     setStep('scanning');
     fetch('/api/detect-slots', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: targetUrl }),
+      body: JSON.stringify({ url: targetUrl, creativeWidth, creativeHeight, fileId, device }),
     })
       .then(r => r.json())
       .then(data => {
@@ -80,7 +96,7 @@ function ResultsPageInner() {
         setStep('results');
       })
       .catch(() => { setError('Could not reach the server. Please try again.'); setStep('error'); });
-  }, [fileId, targetUrl]);
+  }, [fileId, targetUrl, device]);
 
   const handleSelectSlot = (slot: AdSlot) => {
     setSelectedSlot(slot);
@@ -92,13 +108,15 @@ function ResultsPageInner() {
   };
 
   const handleRetry = () => {
+    const creativeWidth = Number(sessionStorage.getItem('ls_width') ?? 0);
+    const creativeHeight = Number(sessionStorage.getItem('ls_height') ?? 0);
     setStep('scanning');
     setError(null);
     setDetection(null);
     fetch('/api/detect-slots', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: targetUrl }),
+      body: JSON.stringify({ url: targetUrl, creativeWidth, creativeHeight, fileId, device }),
     })
       .then(r => r.json())
       .then(data => {
@@ -166,16 +184,43 @@ function ResultsPageInner() {
             <div className="animate-fade-in flex items-end justify-between gap-6 flex-wrap">
               <div>
                 <p className="font-mono text-xs tracking-widest uppercase text-[var(--text-muted)] mb-2">Results</p>
-                <h2 className="font-serif text-4xl sm:text-5xl text-black">
-                  {detection.slots.length > 0
-                    ? <>{detection.slots.length} ad slot{detection.slots.length !== 1 ? 's' : ''} <span className="italic">found.</span></>
-                    : <>No ad slots <span className="italic">found.</span></>
+                {(() => {
+                  const visibleSlots = filterCompatibleSlots(detection.slots, creative);
+                  const isFiltered = creative && creative.width > 0 && creative.height > 0;
+                  if (visibleSlots.length > 0) {
+                    return (
+                      <>
+                        <h2 className="font-serif text-4xl sm:text-5xl text-black">
+                          {visibleSlots.length} matching slot{visibleSlots.length !== 1 ? 's' : ''} <span className="italic">found.</span>
+                        </h2>
+                        {isFiltered && detection.slots.length !== visibleSlots.length && (
+                          <p className="font-mono text-xs text-[var(--text-muted)] mt-2">
+                            {visibleSlots.length} of {detection.slots.length} slots fit your creative ({creative!.width}×{creative!.height}px)
+                          </p>
+                        )}
+                      </>
+                    );
                   }
-                </h2>
+                  if (isFiltered && detection.slots.length > 0) {
+                    return (
+                      <h2 className="font-serif text-4xl sm:text-5xl text-black">
+                        No matching slots <span className="italic">found.</span>
+                      </h2>
+                    );
+                  }
+                  return (
+                    <h2 className="font-serif text-4xl sm:text-5xl text-black">
+                      No ad slots <span className="italic">found.</span>
+                    </h2>
+                  );
+                })()}
               </div>
-              {detection.slots.length > 0 && (
-                <p className="font-mono text-sm text-[var(--text-muted)]">Click any slot to preview your creative</p>
-              )}
+              {(() => {
+                const visibleSlots = filterCompatibleSlots(detection.slots, creative);
+                return visibleSlots.length > 0 ? (
+                  <p className="font-mono text-sm text-[var(--text-muted)]">Click any slot to preview your creative</p>
+                ) : null;
+              })()}
             </div>
           )}
           {step === 'error' && (
@@ -211,23 +256,35 @@ function ResultsPageInner() {
 
           {step === 'results' && detection && (
             <div className="animate-fade-in">
-              <SlotGrid
-                slots={detection.slots}
-                onSelectSlot={handleSelectSlot}
-                selectedSlotId={selectedSlot?.id}
-              />
+              {(() => {
+                const visibleSlots = filterCompatibleSlots(detection.slots, creative);
+                const isFiltered = creative && creative.width > 0 && creative.height > 0;
+                const noMatch = isFiltered && detection.slots.length > 0 && visibleSlots.length === 0;
+                return (
+                  <SlotGrid
+                    slots={visibleSlots}
+                    onSelectSlot={handleSelectSlot}
+                    selectedSlotId={selectedSlot?.id}
+                    emptyMessage={noMatch ? `No slots match ${creative!.width}×${creative!.height}px` : undefined}
+                    emptySubMessage={noMatch ? `This page has ${detection.slots.length} slot${detection.slots.length !== 1 ? 's' : ''} but none fit your creative. Try a different site.` : undefined}
+                  />
+                );
+              })()}
 
               {/* Footer actions */}
               <div className="mt-12 flex items-center justify-between border-t border-[var(--line)] pt-8">
                 <button onClick={handleBack} className="btn-ghost">
                   ← Scan another site
                 </button>
-                {detection.slots.length > 0 && (
-                  <p className="font-mono text-sm text-[var(--text-muted)]">
-                    {detection.slots.length} slot{detection.slots.length !== 1 ? 's' : ''} detected on{' '}
-                    <span className="text-black">{new URL(targetUrl).hostname}</span>
-                  </p>
-                )}
+                {(() => {
+                  const visibleSlots = filterCompatibleSlots(detection.slots, creative);
+                  return visibleSlots.length > 0 ? (
+                    <p className="font-mono text-sm text-[var(--text-muted)]">
+                      {visibleSlots.length} slot{visibleSlots.length !== 1 ? 's' : ''} detected on{' '}
+                      <span className="text-black">{new URL(targetUrl).hostname}</span>
+                    </p>
+                  ) : null;
+                })()}
               </div>
             </div>
           )}

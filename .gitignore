@@ -45,5 +45,6 @@ REQUIREMENTS.md
 ARCHITECTURE.md
 
 .agents
+.claude
 
 .skills-lock.json

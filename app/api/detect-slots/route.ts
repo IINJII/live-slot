@@ -7,7 +7,17 @@ export const maxDuration = 60;
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { url } = body as { url: string };
+    const { url, creativeWidth = 0, creativeHeight = 0, fileId = '', device = 'desktop' } = body as {
+      url: string; creativeWidth?: number; creativeHeight?: number; fileId?: string;
+      device?: 'mobile' | 'tablet' | 'desktop';
+    };
+
+    const VIEWPORTS = {
+      mobile:  { width: 390,  height: 844  },
+      tablet:  { width: 768,  height: 1024 },
+      desktop: { width: 1440, height: 900  },
+    };
+    const viewport = VIEWPORTS[device] ?? VIEWPORTS.desktop;
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
@@ -37,7 +47,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const { slots, screenshotBase64, pageWidth, pageHeight, pageHTML } = await detectAdSlots(url);
+    const { slots, screenshotBase64, pageWidth, pageHeight, pageHTML } = await detectAdSlots(url, creativeWidth, creativeHeight, fileId, viewport);
 
     const result: DetectionResult = {
       url,
