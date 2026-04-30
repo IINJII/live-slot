@@ -65,7 +65,9 @@ export async function compositeCreativeOnScreenshot({
     clampedX,
     clampedY,
     clampedW,
-    clampedH
+    clampedH,
+    imgWidth,
+    imgHeight,
   );
 
   // Composite creative onto screenshot
@@ -88,11 +90,23 @@ async function drawSlotHighlight(
   x: number,
   y: number,
   w: number,
-  h: number
+  h: number,
+  imgWidth: number,
+  imgHeight: number,
 ): Promise<Buffer> {
+  // Composite position — pull back 4px for the border overhang, clamped to image bounds
+  const compLeft = Math.max(0, x - 4);
+  const compTop = Math.max(0, y - 4);
+
+  // SVG must not extend past the image edge
+  const svgW = Math.min(w + 8, imgWidth - compLeft);
+  const svgH = Math.min(h + 8, imgHeight - compTop);
+
+  if (svgW <= 0 || svgH <= 0) return sharp(screenshotBuffer).png().toBuffer();
+
   const borderSvg = `
-    <svg width="${w + 8}" height="${h + 8}" xmlns="http://www.w3.org/2000/svg">
-      <rect x="2" y="2" width="${w + 4}" height="${h + 4}" 
+    <svg width="${svgW}" height="${svgH}" xmlns="http://www.w3.org/2000/svg">
+      <rect x="2" y="2" width="${svgW - 4}" height="${svgH - 4}"
         fill="none" stroke="#6366f1" stroke-width="4" stroke-dasharray="8,4" rx="2"/>
     </svg>
   `;
@@ -101,8 +115,8 @@ async function drawSlotHighlight(
     .composite([
       {
         input: Buffer.from(borderSvg),
-        left: Math.max(0, x - 4),
-        top: Math.max(0, y - 4),
+        left: compLeft,
+        top: compTop,
       },
     ])
     .png()

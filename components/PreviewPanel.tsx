@@ -1,260 +1,170 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AdSlot, Creative, DetectionResult, PreviewResult } from "@/types";
-
-const PAGE_RENDER_WIDTH = 1440;
-
-type ActiveTab = "screenshot" | "dom";
+import { AdSlot, Creative, DetectionResult } from "@/types";
 
 // ---------------------------------------------------------------------------
-// Phase 1 — pre-process page HTML once per detection session (browser-side)
-// Strips scripts/CSP, rewrites relative URLs to absolute, injects <base> tag.
-// Uses native DOMParser so URL resolution is identical to the browser engine.
+// OverlayView — pixel-accurate creative overlay on top of the full-page screenshot.
+// Uses the same (slot.x, slot.y) coordinates recorded during Puppeteer detection.
+// No HTML re-rendering, no iframe, no selector lookup — works on every site.
 // ---------------------------------------------------------------------------
-function preprocessHtml(html: string, baseUrl: string): string {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-
-  // Remove all <script> tags — prevents CORS JS errors in the sandboxed iframe
-  doc.querySelectorAll("script").forEach((el) => el.remove());
-
-  // Remove CSP meta tags — would block data: URIs and external resources
-  doc.querySelectorAll("meta[http-equiv]").forEach((el) => {
-    if (
-      (el.getAttribute("http-equiv") ?? "").toLowerCase() ===
-      "content-security-policy"
-    ) {
-      el.remove();
-    }
-  });
-
-  // Remove existing <base> tags
-  doc.querySelectorAll("base").forEach((el) => el.remove());
-
-  // Inject <base href="{origin}/"> at top of <head> so remaining relative URLs resolve
-  const origin = new URL(baseUrl).origin;
-  const base = doc.createElement("base");
-  base.setAttribute("href", origin + "/");
-  doc.head.insertBefore(base, doc.head.firstChild);
-
-  // Rewrite src / href / srcset / action / data-src / poster to absolute
-  const attrTagMap: [string, string][] = [
-    ["src", "img,script,iframe,video,audio,source,input,embed,track"],
-    ["href", "a,link,area"],
-    ["action", "form"],
-    ["data-src", "img"],
-    ["poster", "video"],
-  ];
-  for (const [attr, selector] of attrTagMap) {
-    doc.querySelectorAll(selector).forEach((el) => {
-      const val = el.getAttribute(attr);
-      if (
-        !val ||
-        val.startsWith("data:") ||
-        val.startsWith("blob:") ||
-        val.startsWith("#")
-      )
-        return;
-      try {
-        el.setAttribute(attr, new URL(val, baseUrl).href);
-      } catch {
-        /* leave as-is */
-      }
-    });
-  }
-
-  // Rewrite srcset (comma-separated "url [descriptor]" pairs)
-  doc.querySelectorAll("[srcset]").forEach((el) => {
-    const srcset = el.getAttribute("srcset");
-    if (!srcset) return;
-    el.setAttribute(
-      "srcset",
-      srcset
-        .split(",")
-        .map((part) => {
-          const [url, ...rest] = part.trim().split(/\s+/);
-          try {
-            return [new URL(url, baseUrl).href, ...rest].join(" ");
-          } catch {
-            return part;
-          }
-        })
-        .join(", "),
-    );
-  });
-
-  // Rewrite url() inside inline style attributes
-  doc.querySelectorAll("[style]").forEach((el) => {
-    const style = el.getAttribute("style");
-    if (!style) return;
-    el.setAttribute(
-      "style",
-      style.replace(/url\(['"]?([^'")\s]+)['"]?\)/g, (_, u) => {
-        if (u.startsWith("data:") || u.startsWith("blob:"))
-          return `url('${u}')`;
-        try {
-          return `url('${new URL(u, baseUrl).href}')`;
-        } catch {
-          return `url('${u}')`;
-        }
-      }),
-    );
-  });
-
-  // Rewrite url() inside inline <style> blocks
-  doc.querySelectorAll("style").forEach((el) => {
-    el.textContent = (el.textContent ?? "").replace(
-      /url\(['"]?([^'")\s]+)['"]?\)/g,
-      (_, u) => {
-        if (u.startsWith("data:") || u.startsWith("blob:"))
-          return `url('${u}')`;
-        try {
-          return `url('${new URL(u, baseUrl).href}')`;
-        } catch {
-          return `url('${u}')`;
-        }
-      },
-    );
-  });
-
-  // Use outerHTML (HTML5 serialization) — NOT XMLSerializer which outputs XHTML
-  // and breaks void elements like <br/>, <input/> inside an HTML5 iframe
-  return "<!DOCTYPE html>" + doc.documentElement.outerHTML;
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2 — inject creative into pre-processed HTML for a specific slot
-// Runs synchronously in ~10ms per slot. No network call.
-// ---------------------------------------------------------------------------
-function injectCreativeIntoHtml(
-  processedHtml: string,
-  slot: AdSlot,
-  dataUri: string,
-  mimeType: string,
-): { html: string } | { error: string } {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(processedHtml, "text/html");
-
-  // Build the creative element
-  const creativeStyle =
-    "width:100%;height:100%;display:block;object-fit:contain;";
-  let creativeInner: string;
-  if (mimeType.startsWith("video/")) {
-    creativeInner = `<video src="${dataUri}" style="${creativeStyle}" autoplay muted loop playsinline></video>`;
-  } else if (
-    mimeType === "application/zip" ||
-    mimeType === "application/x-zip-compressed"
-  ) {
-    creativeInner = `<div style="${creativeStyle}background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span style="color:#6366f1;font-family:monospace;font-size:14px;font-weight:bold;">HTML5</span><span style="color:#94a3b8;font-family:monospace;font-size:11px;margin-top:4px;">Rich Media Ad</span></div>`;
-  } else {
-    creativeInner = `<img src="${dataUri}" alt="Ad Creative" style="${creativeStyle}" />`;
-  }
-  const badge = `<div style="position:absolute;bottom:4px;right:4px;background:#000;color:#fff;font-family:monospace;font-size:10px;padding:2px 6px;letter-spacing:0.1em;text-transform:uppercase;z-index:9999;">Your Ad</div>`;
-  const wrapped = `<div style="position:relative;width:${slot.width}px;height:${slot.height}px;overflow:hidden;outline:3px solid #000;flex-shrink:0;">${creativeInner}${badge}</div>`;
-
-  const slotStyle =
-    `position:relative;overflow:hidden;width:${slot.width}px;height:${slot.height}px;` +
-    `max-width:${slot.width}px;max-height:${slot.height}px;display:block;flex-shrink:0;`;
-
-  // Try recorded CSS selector + selectorIndex first
-  let target: Element | null = null;
-  if (slot.selector && slot.selector !== "iab-dimension-match") {
-    try {
-      const matches = doc.querySelectorAll(slot.selector);
-      target = matches[slot.selectorIndex ?? 0] ?? matches[0] ?? null;
-    } catch {
-      /* invalid selector */
-    }
-  }
-
-  // Fallback: find element with matching inline width/height style
-  if (!target) {
-    const candidates = doc.querySelectorAll("div,aside,section,ins");
-    for (const el of Array.from(candidates)) {
-      const s = el.getAttribute("style") ?? "";
-      const wm = s.match(/width\s*:\s*(\d+)px/);
-      const hm = s.match(/height\s*:\s*(\d+)px/);
-      if (wm && hm) {
-        if (
-          Math.abs(parseInt(wm[1], 10) - slot.width) <= 12 &&
-          Math.abs(parseInt(hm[1], 10) - slot.height) <= 12
-        ) {
-          target = el;
-          break;
-        }
-      }
-    }
-  }
-
-  if (!target)
-    return { error: "Could not locate the ad slot element in the page HTML." };
-
-  (target as HTMLElement).setAttribute("style", slotStyle);
-  target.innerHTML = wrapped;
-
-  return { html: "<!DOCTYPE html>" + doc.documentElement.outerHTML };
-}
-
-// ---------------------------------------------------------------------------
-// DomIframeView — scaled iframe with auto-scroll to slot position
-// ---------------------------------------------------------------------------
-function DomIframeView({
-  html,
+function OverlayView({
   slot,
-  pageHeight,
+  creative,
+  detection,
+  creativeB64,
 }: {
-  html: string;
   slot: AdSlot;
-  pageHeight: number;
+  creative: Creative;
+  detection: DetectionResult;
+  creativeB64: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(1);
-  const [containerWidth, setContainerWidth] = useState(PAGE_RENDER_WIDTH);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const [scale, setScale] = useState(0);
 
+  // Compute scale whenever the screenshot image resizes
   useEffect(() => {
-    if (!containerRef.current) return;
-    const obs = new ResizeObserver((entries) => {
-      const w = entries[0].contentRect.width;
-      setContainerWidth(w);
-      setScale(w / PAGE_RENDER_WIDTH);
+    const img = imgRef.current;
+    if (!img) return;
+    const obs = new ResizeObserver(() => {
+      if (img.naturalWidth > 0) {
+        setScale(img.clientWidth / img.naturalWidth);
+      }
     });
-    obs.observe(containerRef.current);
+    obs.observe(img);
+    if (img.complete && img.naturalWidth > 0) {
+      setScale(img.clientWidth / img.naturalWidth);
+    }
     return () => obs.disconnect();
   }, []);
 
+  // Scroll so the slot is visible whenever slot or scale changes
   useEffect(() => {
-    if (!containerRef.current) return;
-    containerRef.current.scrollTop = Math.max(0, (slot.y - 160) * scale);
-  }, [html, slot.y, scale]);
+    if (!containerRef.current || scale === 0) return;
+    containerRef.current.scrollTop = Math.max(0, slot.y * scale - 160);
+  }, [slot.id, scale]);
+
+  const slotL = slot.x * scale;
+  const slotT = slot.y * scale;
+  const slotW = slot.width * scale;
+  const slotH = slot.height * scale;
+
+  const dataUri = `data:${creative.mimeType};base64,${creativeB64}`;
 
   return (
-    <div
-      ref={containerRef}
-      className="flex-1 overflow-auto bg-[var(--surface-2)]"
-    >
-      <div
-        className="relative"
-        style={{
-          width: containerWidth,
-          height: Math.max(pageHeight * scale, 400),
-        }}
-      >
-        <iframe
-          srcDoc={html}
-          title="Live preview"
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: PAGE_RENDER_WIDTH,
-            height: pageHeight || 4000,
-            border: "none",
-            transformOrigin: "top left",
-            transform: `scale(${scale})`,
-            pointerEvents: "none",
+    <div ref={containerRef} className="flex-1 overflow-auto bg-[var(--surface-2)]">
+      <div className="relative inline-block w-full">
+        {/* Full-page screenshot as base */}
+        <img
+          ref={imgRef}
+          src={`data:image/jpeg;base64,${detection.screenshotBase64}`}
+          alt="Page screenshot"
+          className="w-full block"
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            if (img.naturalWidth > 0) setScale(img.clientWidth / img.naturalWidth);
           }}
         />
+
+        {scale > 0 && (
+          <>
+            {/* Dashed slot border */}
+            <div
+              style={{
+                position: "absolute",
+                left: slotL,
+                top: slotT,
+                width: slotW,
+                height: slotH,
+                outline: "3px dashed #6366f1",
+                pointerEvents: "none",
+                boxSizing: "border-box",
+              }}
+            />
+
+            {/* Creative overlay — clipped to slot bounds */}
+            <div
+              style={{
+                position: "absolute",
+                left: slotL,
+                top: slotT,
+                width: slotW,
+                height: slotH,
+                overflow: "hidden",
+                background: "#e5e5e5",
+                pointerEvents: "none",
+              }}
+            >
+              {creative.mimeType.startsWith("video/") ? (
+                <video
+                  src={dataUri}
+                  autoPlay
+                  muted
+                  loop
+                  playsInline
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    display: "block",
+                  }}
+                />
+              ) : creative.mimeType === "application/zip" ||
+                creative.mimeType === "application/x-zip-compressed" ? (
+                <div
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    background: "#0f172a",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <span style={{ color: "#6366f1", fontFamily: "monospace", fontSize: 14, fontWeight: "bold" }}>
+                    HTML5
+                  </span>
+                  <span style={{ color: "#94a3b8", fontFamily: "monospace", fontSize: 11, marginTop: 4 }}>
+                    Rich Media Ad
+                  </span>
+                </div>
+              ) : (
+                <img
+                  src={dataUri}
+                  alt="Ad Creative"
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    display: "block",
+                  }}
+                />
+              )}
+            </div>
+
+            {/* "Your Ad" badge */}
+            <div
+              style={{
+                position: "absolute",
+                left: slotL,
+                top: slotT,
+                background: "#000",
+                color: "#fff",
+                fontFamily: "monospace",
+                fontSize: 10,
+                padding: "2px 6px",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                pointerEvents: "none",
+                lineHeight: 1.6,
+              }}
+            >
+              Your Ad
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -278,30 +188,13 @@ export default function PreviewPanel({
   isOpen,
   onClose,
 }: PreviewPanelProps) {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("screenshot");
-
-  // Screenshot tab state
-  const [preview, setPreview] = useState<PreviewResult | null>(null);
-  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-
-  // DOM tab state
-  const [domHtml, setDomHtml] = useState<string | null>(null);
-  const [domError, setDomError] = useState<string | null>(null);
-  const [isLoadingDom, setIsLoadingDom] = useState(false);
-
-  // Animation
+  const [overlayError, setOverlayError] = useState<string | null>(null);
   const [isClosing, setIsClosing] = useState(false);
 
-  // Refs — hold cached data without triggering re-renders
-  const processedHtmlRef = useRef<string | null>(null);
-  const processedForUrlRef = useRef<string | null>(null); // tracks which detectedAt the cache is for
-  const creativeBase64Ref = useRef<{ fileId: string; b64: string } | null>(
-    null,
-  );
+  // Cached creative base64 — fetched once per fileId
+  const creativeBase64Ref = useRef<{ fileId: string; b64: string } | null>(null);
   const [creativeReady, setCreativeReady] = useState(false);
 
-  // Close with animation
   const handleClose = () => {
     setIsClosing(true);
     setTimeout(() => {
@@ -324,55 +217,34 @@ export default function PreviewPanel({
   useEffect(() => {
     if (isOpen) document.body.style.overflow = "hidden";
     else document.body.style.overflow = "";
-    return () => {
-      document.body.style.overflow = "";
-    };
+    return () => { document.body.style.overflow = ""; };
   }, [isOpen]);
 
   // ---------------------------------------------------------------------------
-  // Effect 1 — pre-process page HTML once per detection session
-  // Keyed on detectedAt so a re-scan invalidates the cache.
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (!detection) return;
-    if (processedForUrlRef.current === detection.detectedAt) return; // already processed
-    processedHtmlRef.current = preprocessHtml(
-      detection.pageHTML,
-      detection.url,
-    );
-    processedForUrlRef.current = detection.detectedAt;
-  }, [detection?.detectedAt]);
-
-  // ---------------------------------------------------------------------------
-  // Effect 2 — fetch + cache creative base64
-  // Runs on every panel open (isOpen) so we always have a fresh fetch if the
-  // Vercel /tmp instance changed between upload and panel open.
-  // Cache hit (same fileId + already have b64) skips the network call.
+  // Fetch + cache creative base64
+  // Runs on every panel open so we re-fetch if the Vercel /tmp instance changed.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!isOpen || !creative) return;
 
-    // Cache hit — same creative already fetched this session
     if (creativeBase64Ref.current?.fileId === creative.fileId) {
       setCreativeReady(true);
       return;
     }
 
     setCreativeReady(false);
-    setDomError(null);
+    setOverlayError(null);
 
     fetch(creative.tempUrl)
       .then((r) => {
-        if (!r.ok)
-          throw new Error(`Could not load creative file (${r.status}).`);
+        if (!r.ok) throw new Error(`Could not load creative file (${r.status}).`);
         return r.blob();
       })
       .then(
         (blob) =>
           new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = () =>
-              resolve((reader.result as string).split(",")[1]);
+            reader.onload = () => resolve((reader.result as string).split(",")[1]);
             reader.onerror = reject;
             reader.readAsDataURL(blob);
           }),
@@ -382,74 +254,9 @@ export default function PreviewPanel({
         setCreativeReady(true);
       })
       .catch((err) =>
-        setDomError(
-          err instanceof Error ? err.message : "Could not load creative file.",
-        ),
+        setOverlayError(err instanceof Error ? err.message : "Could not load creative file."),
       );
   }, [isOpen, creative?.fileId]);
-
-  // ---------------------------------------------------------------------------
-  // Effect 3 — inject creative into pre-processed HTML per slot (synchronous)
-  // Only runs when DOM tab is active + creative is cached + HTML is pre-processed.
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (!isOpen || activeTab !== "dom") return;
-    if (!slot || !creative) return;
-    if (!creativeReady || !creativeBase64Ref.current) return;
-    if (!processedHtmlRef.current) return;
-
-    setDomError(null);
-    setDomHtml(null);
-    setIsLoadingDom(true);
-
-    const dataUri = `data:${creative.mimeType};base64,${creativeBase64Ref.current.b64}`;
-    const result = injectCreativeIntoHtml(
-      processedHtmlRef.current,
-      slot,
-      dataUri,
-      creative.mimeType,
-    );
-
-    if ("error" in result) {
-      setDomError(result.error);
-    } else {
-      setDomHtml(result.html);
-    }
-    setIsLoadingDom(false);
-  }, [isOpen, activeTab, slot?.id, creativeReady]);
-
-  // ---------------------------------------------------------------------------
-  // Screenshot effect — uses cached creative base64 from Effect 2
-  // Waits for creativeReady so it never races the fetch.
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (!isOpen || !slot || !creative || !detection) return;
-    if (!creativeReady || !creativeBase64Ref.current) return;
-
-    setPreview(null);
-    setPreviewError(null);
-    setIsLoadingPreview(true);
-
-    fetch("/api/screenshot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        creativeBase64: creativeBase64Ref.current.b64,
-        creativeMimeType: creative.mimeType,
-        slot,
-        screenshotBase64: detection.screenshotBase64,
-        pageWidth: detection.pageWidth,
-        pageHeight: detection.pageHeight,
-      }),
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.error) setPreviewError(data.error);
-        else setPreview(data);
-      })
-      .catch(() => setPreviewError("Failed to generate preview."))
-      .finally(() => setIsLoadingPreview(false));
-  }, [isOpen, slot?.id, creative?.fileId, detection?.url, creativeReady]);
 
   if (!isOpen || !slot || !creative || !detection) return null;
 
@@ -472,25 +279,11 @@ export default function PreviewPanel({
             onClick={handleClose}
             className="flex items-center gap-3 px-6 py-4 border-r border-[var(--line)] hover:bg-[var(--surface-2)] transition-colors"
           >
-            <svg
-              className="w-4 h-4"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M6 18L18 6M6 6l12 12"
-              />
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
-            <span className="font-mono text-sm tracking-widest uppercase">
-              Close
-            </span>
-            <span className="font-mono text-xs text-[var(--text-dim)] hidden sm:block">
-              Esc
-            </span>
+            <span className="font-mono text-sm tracking-widest uppercase">Close</span>
+            <span className="font-mono text-xs text-[var(--text-dim)] hidden sm:block">Esc</span>
           </button>
 
           {/* Slot info */}
@@ -512,121 +305,53 @@ export default function PreviewPanel({
             </p>
           </div>
 
-          {/* Tab switcher */}
-          <div className="flex shrink-0 border-l border-[var(--line)]">
-            {(["screenshot", "dom"] as ActiveTab[]).map((tab) => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                className="px-8 py-4 font-mono text-sm tracking-widest uppercase transition-colors border-r border-[var(--line)] last:border-r-0"
-                style={{
-                  background: activeTab === tab ? "#000" : "#fff",
-                  color: activeTab === tab ? "#fff" : "#666",
-                }}
-              >
-                {tab === "screenshot" ? "Screenshot" : "DOM Preview"}
-              </button>
-            ))}
+          {/* Creative info */}
+          <div className="hidden lg:flex items-center gap-3 px-6 border-l border-[var(--line)]">
+            {(creative.fileType === "image" || creative.fileType === "gif") && (
+              <div className="w-8 h-8 border border-[var(--line)] overflow-hidden bg-[var(--surface-2)] shrink-0">
+                <img src={creative.tempUrl} alt="" className="w-full h-full object-contain" />
+              </div>
+            )}
+            <span className="font-mono text-xs text-[var(--text-muted)] truncate max-w-[160px]">
+              {creative.fileName}
+            </span>
           </div>
         </div>
 
         {/* Body */}
         <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-          {/* Screenshot tab */}
-          {activeTab === "screenshot" && (
-            <div className="flex-1 overflow-auto">
-              {isLoadingPreview ? (
-                <div className="flex flex-col items-center justify-center gap-6 py-32">
-                  <div className="relative w-16 h-px bg-[var(--line)] overflow-visible">
-                    <div className="scan-line" />
-                  </div>
-                  <p className="font-mono text-sm tracking-widest uppercase text-[var(--text-muted)]">
-                    Compositing creative…
-                  </p>
-                </div>
-              ) : previewError ? (
-                <div className="flex flex-col items-center gap-4 py-24 max-w-md mx-auto text-center">
-                  <p className="font-serif text-2xl text-black">
-                    Preview failed
-                  </p>
-                  <p className="font-sans-ui text-base text-[var(--text-muted)]">
-                    {previewError}
-                  </p>
-                </div>
-              ) : preview ? (
-                <div>
-                  <div className="border-b border-[var(--line)]">
-                    <img
-                      src={`data:image/png;base64,${preview.compositeImageBase64}`}
-                      alt="Preview"
-                      className="w-full block"
-                    />
-                  </div>
-                  <div className="px-8 py-6 border-b border-[var(--line)] flex items-center gap-6">
-                    <div className="w-12 h-12 border border-[var(--line)] overflow-hidden bg-[var(--surface-2)] shrink-0">
-                      {(creative.fileType === "image" ||
-                        creative.fileType === "gif") && (
-                        <img
-                          src={creative.tempUrl}
-                          alt=""
-                          className="w-full h-full object-contain"
-                        />
-                      )}
-                    </div>
-                    <div>
-                      <p className="font-sans-ui text-base font-600 text-black">
-                        {creative.fileName}
-                      </p>
-                      <p className="font-mono text-sm text-[var(--text-muted)] mt-0.5">
-                        Previewed in {slot.iabName} slot — {slot.width}×
-                        {slot.height}px at position ({slot.x}, {slot.y})
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
+          {!creativeReady ? (
+            <div className="flex flex-col items-center justify-center gap-6 py-32">
+              <div className="relative w-16 h-px bg-[var(--line)] overflow-visible">
+                <div className="scan-line" />
+              </div>
+              <p className="font-mono text-sm tracking-widest uppercase text-[var(--text-muted)]">
+                Loading creative…
+              </p>
             </div>
-          )}
-
-          {/* DOM tab */}
-          {activeTab === "dom" && (
-            <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-              {isLoadingDom ? (
-                <div className="flex flex-col items-center justify-center gap-6 py-32">
-                  <div className="relative w-16 h-px bg-[var(--line)] overflow-visible">
-                    <div className="scan-line" />
-                  </div>
-                  <p className="font-mono text-sm tracking-widest uppercase text-[var(--text-muted)]">
-                    Injecting creative into DOM…
-                  </p>
-                </div>
-              ) : domError ? (
-                <div className="flex flex-col items-center gap-4 py-24 max-w-md mx-auto text-center">
-                  <p className="font-serif text-2xl text-black">
-                    DOM preview failed
-                  </p>
-                  <p className="font-sans-ui text-base text-[var(--text-muted)]">
-                    {domError}
-                  </p>
-                  <button
-                    onClick={() => {
-                      setDomHtml(null);
-                      setDomError(null);
-                    }}
-                    className="btn-primary"
-                  >
-                    Retry
-                  </button>
-                </div>
-              ) : domHtml ? (
-                <DomIframeView
-                  html={domHtml}
-                  slot={slot}
-                  pageHeight={detection.pageHeight}
-                />
-              ) : null}
+          ) : overlayError ? (
+            <div className="flex flex-col items-center gap-4 py-24 max-w-md mx-auto text-center">
+              <p className="font-serif text-2xl text-black">Preview failed</p>
+              <p className="font-sans-ui text-base text-[var(--text-muted)]">{overlayError}</p>
+              <button
+                onClick={() => {
+                  setOverlayError(null);
+                  setCreativeReady(false);
+                  creativeBase64Ref.current = null;
+                }}
+                className="btn-primary"
+              >
+                Retry
+              </button>
             </div>
-          )}
+          ) : creativeBase64Ref.current ? (
+            <OverlayView
+              slot={slot}
+              creative={creative}
+              detection={detection}
+              creativeB64={creativeBase64Ref.current.b64}
+            />
+          ) : null}
         </div>
       </div>
     </>

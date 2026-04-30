@@ -55,14 +55,14 @@ export async function detectAdSlots(url: string): Promise<{
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
 
-    // Navigate with a timeout
+    // Navigate to DOMContentLoaded — fast and reliable on heavy pages.
+    // networkidle2 never settles on pages with trackers/ads and causes timeouts.
     await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
+      waitUntil: 'domcontentloaded',
     });
 
-    // Wait a bit for lazy-loaded ads
-    await new Promise((r) => setTimeout(r, 2000));
+    // Wait for network to settle up to 5s, but don't block if it never fully idles
+    await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
 
     // Get page dimensions
     const pageMetrics = await page.evaluate(() => ({
@@ -93,10 +93,25 @@ export async function detectAdSlots(url: string): Promise<{
         // Track how many times we've emitted each selector so we know the nth index
         const selectorCount: Record<string, number> = {};
 
+        // Read once — values don't change during evaluate
+        const scrollX = window.scrollX;
+        const scrollY = window.scrollY;
+
+        function isElementVisible(el: Element): boolean {
+          const h = el as HTMLElement;
+          // Cheap checks first — avoid getComputedStyle unless necessary
+          if (h.hidden) return false;
+          if (h.offsetParent === null && h.tagName !== 'BODY') return false;
+          const style = window.getComputedStyle(el);
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0'
+          );
+        }
+
         function processElement(el: Element, selector: string) {
           const rect = el.getBoundingClientRect();
-          const scrollX = window.scrollX;
-          const scrollY = window.scrollY;
 
           const absX = rect.left + scrollX;
           const absY = rect.top + scrollY;
@@ -109,12 +124,6 @@ export async function detectAdSlots(url: string): Promise<{
           if (seen.has(key)) return;
           seen.add(key);
 
-          const style = window.getComputedStyle(el);
-          const isVisible =
-            style.display !== 'none' &&
-            style.visibility !== 'hidden' &&
-            style.opacity !== '0';
-
           const idx = selectorCount[selector] ?? 0;
           selectorCount[selector] = idx + 1;
 
@@ -125,29 +134,52 @@ export async function detectAdSlots(url: string): Promise<{
             height: Math.round(h),
             selector,
             selectorIndex: idx,
-            isVisible,
+            isVisible: isElementVisible(el),
           });
         }
 
-        // Query known ad selectors
-        for (const selector of selectors) {
-          try {
-            document.querySelectorAll(selector).forEach((el) => {
-              processElement(el, selector);
-            });
-          } catch {
-            // Invalid selector, skip
+        // Single querySelectorAll pass for all ad selectors — one tree traversal instead of ~40
+        const combined = selectors.join(',');
+        try {
+          document.querySelectorAll(combined).forEach((el) => {
+            // Identify which selector matched this element
+            for (const selector of selectors) {
+              try {
+                if (el.matches(selector)) {
+                  processElement(el, selector);
+                  break;
+                }
+              } catch { /* invalid selector */ }
+            }
+          });
+        } catch {
+          // Combined selector invalid — fall back to individual queries
+          for (const selector of selectors) {
+            try {
+              document.querySelectorAll(selector).forEach((el) => {
+                processElement(el, selector);
+              });
+            } catch { /* invalid selector, skip */ }
           }
         }
 
-        // Also find elements by IAB dimensions
+        // IAB dimension scan — pre-filter with offsetWidth/Height before forcing layout reflow
         const allDivs = document.querySelectorAll('div, aside, section');
         allDivs.forEach((el) => {
+          const h = el as HTMLElement;
+          const ow = h.offsetWidth;
+          const oh = h.offsetHeight;
+          // Cheap check: skip elements whose offset dimensions can't match any IAB size
+          const couldBeIab = iabSizes.some(
+            (s) => Math.abs(s.width - ow) <= tolerance && Math.abs(s.height - oh) <= tolerance
+          );
+          if (!couldBeIab) return;
+          // Only call getBoundingClientRect() on IAB-sized candidates
           const rect = el.getBoundingClientRect();
           const w = Math.round(rect.width);
-          const h = Math.round(rect.height);
+          const hh = Math.round(rect.height);
           const isIab = iabSizes.some(
-            (s) => Math.abs(s.width - w) <= tolerance && Math.abs(s.height - h) <= tolerance
+            (s) => Math.abs(s.width - w) <= tolerance && Math.abs(s.height - hh) <= tolerance
           );
           if (isIab) {
             processElement(el, 'iab-dimension-match');
@@ -161,17 +193,13 @@ export async function detectAdSlots(url: string): Promise<{
       IAB_SIZE_TOLERANCE
     );
 
-    // Take full page screenshot
-    const screenshotBuffer = await page.screenshot({
-      fullPage: true,
-      type: 'jpeg',
-      quality: 85,
-    });
+    // Run screenshot + HTML capture concurrently — saves 1-2s on large pages
+    const [screenshotBuffer, pageHTML] = await Promise.all([
+      page.screenshot({ fullPage: true, type: 'jpeg', quality: 85 }),
+      page.content(),
+    ]);
 
     const screenshotBase64 = Buffer.from(screenshotBuffer).toString('base64');
-
-    // Capture fully-rendered HTML (post-JS, ad slots present in DOM)
-    const pageHTML = await page.content();
 
     // Build AdSlot objects
     const slots: AdSlot[] = rawSlots.map((s) => ({

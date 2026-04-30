@@ -32,7 +32,7 @@ export default function SlotGrid({ slots, onSelectSlot, selectedSlotId }: SlotGr
   }
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-0 border-l border-t border-black">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 border-t border-l border-black">
       {slots.map((slot, i) => {
         const isSelected = selectedSlotId === slot.id;
         return (
