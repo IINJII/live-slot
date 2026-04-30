@@ -29,13 +29,11 @@ User clicks a slot         → Opens PreviewPanel
                            → Sharp composites creative onto screenshot
                            → Returns base64 PNG
 
-  [DOM Preview tab]        → Client fetches creative from /api/serve/[fileId]
-                           → Converts to base64 via FileReader
-                           → POST /api/inject-creative (creativeBase64 + slot + pageHTML)
-                           → node-html-parser strips scripts, rewrites URLs, injects creative
-                             into slot element by CSS selector + selectorIndex
-                           → Returns full HTML string
-                           → Rendered in <iframe srcdoc> in the browser
+  [DOM Preview tab]        → creative base64 already cached in creativeBase64Ref (fetched once)
+                           → processedHtml already cached in processedHtmlRef (preprocessed once)
+                           → injectCreativeIntoHtml() runs client-side in ~10ms (no network call)
+                           → DOMParser finds slot element by selector+selectorIndex, replaces innerHTML
+                           → doc.documentElement.outerHTML → set as iframe srcdoc directly
 ```
 
 ---
@@ -53,7 +51,6 @@ app/
     detect-slots/route.ts       ← Triggers Puppeteer, returns slots + screenshot + pageHTML
     serve/[fileId]/route.ts     ← Reads file from /tmp, serves as raw bytes
     screenshot/route.ts         ← Composites creative onto screenshot using Sharp
-    inject-creative/route.ts    ← Parses pageHTML, injects creative, returns modified HTML
     cleanup/route.ts            ← Deletes file from /tmp
 
 lib/
@@ -156,32 +153,7 @@ Also fully client-side (`'use client'`), wrapped in a `<Suspense>` boundary beca
 
 ## API Route: `POST /api/inject-creative`
 
-**File:** `app/api/inject-creative/route.ts`
-
-The core of the DOM Preview tab. Takes the fully-rendered page HTML captured by Puppeteer and returns a modified version with the creative injected directly into the detected slot element.
-
-**Steps:**
-
-1. **Parse HTML** with `node-html-parser` (`blockTextElements: { script: true, style: true }` so inline scripts are preserved as text nodes for removal).
-2. **Rewrite relative URLs** to absolute — `src`, `href`, `srcset`, `action`, `data-src`, `poster`, inline `style` attributes, and `<style>` blocks are all scanned. Every relative URL is resolved against the page's `baseUrl` via `new URL(value, base).href`.
-3. **Strip all `<script>` tags** — prevents CORS JS errors from firing inside the iframe, and avoids ad network scripts trying to load new ads over the injected one.
-4. **Strip CSP `<meta http-equiv>` tags** — `Content-Security-Policy` meta tags would block the `data:` URI creative inside the iframe.
-5. **Inject `<base href="{origin}/">` ** at the top of `<head>` — ensures any remaining relative URLs in CSS or HTML resolve correctly.
-6. **Build creative HTML** as a `data:` URI embedded directly in the markup:
-   - **Image / GIF** → `<img src="data:...">` with `object-fit:contain`
-   - **Video** → `<video src="data:..." autoplay muted loop>`
-   - **ZIP / HTML5** → placeholder div (full extraction not yet implemented)
-   - All wrapped in a `<div>` with explicit `width`, `height`, `overflow:hidden`
-7. **Locate the slot element** server-side using the recorded `selector` + `selectorIndex`:
-   - `root.querySelectorAll(selector)[selectorIndex]` picks the exact nth match of the selector — not always the first one — which is how the correct slot is identified when the same selector matches multiple elements on the page.
-   - Fallback: if the selector fails or matches nothing, scan all `div/aside/section/ins` elements for one with matching inline `width`/`height` pixel values (within 12px tolerance).
-   - If neither strategy finds the element → return HTTP 422.
-8. **Replace the slot element's contents** with the creative HTML and override its inline style to clamp dimensions to exactly `slot.width × slot.height`.
-9. Return the full modified HTML as `text/html`.
-
-**Why server-side injection?** All `<script>` tags are stripped before the HTML reaches the browser iframe. A runtime injection script (the previous approach) would be stripped along with all other scripts and never execute. Injecting at parse time on the server sidesteps this entirely.
-
-**`selectorIndex`:** During slot detection, Puppeteer records each slot's position in the list of matches for its selector (the 0-based index of that element among all `document.querySelectorAll(selector)` results). This index is stored on the `AdSlot` object and sent to the inject route. Without it, the route would always inject into the first matching element regardless of which slot the user selected.
+**Deleted.** All DOM injection is now done client-side in `PreviewPanel.tsx`. See the DOM Preview tab section under `components/PreviewPanel.tsx`.
 
 ---
 
@@ -239,7 +211,7 @@ The core Puppeteer logic.
    - Deduplicates by a position+size key.
    - Tracks `selectorIndex`: as each element is emitted for a given selector, a counter increments — so the first match gets index 0, the second gets index 1, etc.
    - Filters out elements smaller than 50×30px.
-5. **Screenshot**: `page.screenshot({ fullPage: true })` captures the entire page.
+5. **Screenshot**: `page.screenshot({ fullPage: true, type: 'jpeg', quality: 85 })` captures the entire page. JPEG at q85 produces ~4x smaller base64 than PNG, keeping the `detect-slots` JSON response safely under Vercel's 4.5MB limit when combined with `pageHTML`.
 6. **Capture HTML**: `page.content()` returns the fully-rendered post-JS HTML. This is what gets passed to `/api/inject-creative` — it contains all ad slot elements that were added to the DOM by JavaScript, not just what was in the original HTML source.
 7. **Build `AdSlot` objects**: assigns a UUID, maps dimensions to an IAB name, includes `selector` and `selectorIndex`.
 8. **Deduplication pass**: if two slots overlap by >70% of the smaller one's area, keeps the one with a named CSS selector (preferred over a generic IAB dimension match), or the larger one.
@@ -284,12 +256,28 @@ A full-screen slide-in panel (CSS animation `panel-open` / `panel-close`). Close
 
 ### DOM Preview tab
 
-- Loads **lazily** — fetch only fires when this tab is first activated for a given slot.
-- Fetches `creative.tempUrl` → converts to base64 → POSTs to `/api/inject-creative` with `pageHTML`, `baseUrl`, `slot`, `creativeBase64`, `creativeMimeType`.
-- Renders the returned HTML in a `<iframe srcdoc={html}>` — not `src` — to avoid CORS issues.
-- The iframe is scaled via CSS `transform: scale(containerWidth / 1440)` to fit the panel width.
-- Auto-scrolls to `slot.y * scale` on load so the injected creative is in view.
-- **Slot switching:** reset + fetch are in a single `useEffect` keyed on `slot.id`. It immediately sets `isLoadingDom = true` before clearing `domHtml`, so there is never a blank-screen flash between slots. A `cancelled` flag prevents stale responses from a previous fetch overwriting the current slot's result.
+All processing happens **client-side** — zero API calls after the creative is first fetched. Three effects handle this:
+
+**Effect 1 — pre-process HTML once per scan** (keyed on `detection.detectedAt`):
+- Runs `preprocessHtml(detection.pageHTML, detection.url)` using the browser's native `DOMParser`
+- Strips `<script>` tags, CSP meta tags, existing `<base>` tags
+- Injects `<base href="{origin}/">` at top of `<head>`
+- Rewrites all `src`, `href`, `srcset`, inline `style url()` to absolute using `new URL(value, baseUrl).href`
+- Serializes with `'<!DOCTYPE html>' + doc.documentElement.outerHTML` — not `XMLSerializer` (which produces XHTML and breaks void elements in the iframe)
+- Stores result in `processedHtmlRef` (a `useRef` — no re-render)
+
+**Effect 2 — fetch + cache creative base64 once per `fileId`** (keyed on `creative.fileId`):
+- Cache hit: if `creativeBase64Ref.current.fileId === creative.fileId`, skips fetch, sets `creativeReady = true`
+- Cache miss: fetches `creative.tempUrl`, encodes via `FileReader`, stores `{ fileId, b64 }` in `creativeBase64Ref`, sets `creativeReady = true`
+- `creativeReady` is a boolean state that signals Effect 3 to run once the creative is available
+
+**Effect 3 — inject per slot** (keyed on `slot.id + activeTab + creativeReady`):
+- Reads from `processedHtmlRef` and `creativeBase64Ref` — both already in memory
+- Calls `injectCreativeIntoHtml()`: re-parses with `DOMParser`, finds slot element by `selector + selectorIndex`, replaces `innerHTML` with creative `data:` URI, clamps slot dimensions
+- Serializes result and calls `setDomHtml()` — synchronous, ~10ms
+- No loading state visible to the user — instant render
+
+**Why client-side?** The previous approach (POST to `/api/inject-creative`) had to gzip the HTML, send it over the network, cold-start a Vercel function, decompress, parse with `node-html-parser`, and return a full HTML response — 2–6 seconds per slot. All of that work can be done in the browser using native APIs in ~10ms. No server needed.
 
 ---
 
@@ -339,7 +327,6 @@ Tells Next.js not to bundle these packages — they are required at runtime from
 | Creative sent as base64 in request body | Workaround for the above — client re-fetches the file and forwards it to screenshot and inject-creative routes |
 | `maxDuration = 60` on detect-slots | Puppeteer cold start on Vercel takes 15–25s; default 10s timeout would always fail |
 | Chromium downloaded at runtime | `@sparticuz/chromium` strips the binary from the bundle; it must be fetched from GitHub Releases on first cold start |
-| All `<script>` tags stripped in DOM preview | Prevents CORS errors from ad network scripts inside the iframe; means injection must happen server-side at parse time |
-| `selectorIndex` required for correct slot targeting | The same CSS selector (e.g. `div.ad-slot`) can match many elements; index records which one was detected |
-| HTML5 ZIP creatives show placeholder only | Extracting and inlining a ZIP bundle's assets is not yet implemented |
-| DOM preview may look incomplete | CSS loaded via external stylesheets resolves correctly (base tag + absolute URLs), but fonts and images behind CORS headers may not load in the sandboxed iframe |
+| All DOM processing client-side | `DOMParser` + `outerHTML` are browser-native — no server needed; avoids Vercel body/response size limits and cold starts entirely |
+| Screenshot captured as JPEG q85 | Reduces base64 size ~4x vs PNG; keeps `detect-slots` response under Vercel's 4.5MB limit when combined with `pageHTML` |
+| Creative base64 cached in `useRef` | Avoids re-fetching `/api/serve/[fileId]` on every slot click — fetched once per `fileId` for the entire session |

@@ -164,7 +164,8 @@ export async function detectAdSlots(url: string): Promise<{
     // Take full page screenshot
     const screenshotBuffer = await page.screenshot({
       fullPage: true,
-      type: 'png',
+      type: 'jpeg',
+      quality: 85,
     });
 
     const screenshotBase64 = Buffer.from(screenshotBuffer).toString('base64');

@@ -1,27 +1,156 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { strToU8, gzip } from 'fflate';
 import { AdSlot, Creative, DetectionResult, PreviewResult } from '@/types';
-
-// Gzip a string and return it as a base64-encoded string.
-// This keeps the inject-creative request body well under Vercel's 4.5 MB limit.
-function gzipBase64(str: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    gzip(strToU8(str), (err, compressed) => {
-      if (err) return reject(err);
-      // Convert Uint8Array → base64
-      let binary = '';
-      for (let i = 0; i < compressed.length; i++) binary += String.fromCharCode(compressed[i]);
-      resolve(btoa(binary));
-    });
-  });
-}
 
 const PAGE_RENDER_WIDTH = 1440;
 
 type ActiveTab = 'screenshot' | 'dom';
 
+// ---------------------------------------------------------------------------
+// Phase 1 — pre-process page HTML once per detection session (browser-side)
+// Strips scripts/CSP, rewrites relative URLs to absolute, injects <base> tag.
+// Uses native DOMParser so URL resolution is identical to the browser engine.
+// ---------------------------------------------------------------------------
+function preprocessHtml(html: string, baseUrl: string): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Remove all <script> tags — prevents CORS JS errors in the sandboxed iframe
+  doc.querySelectorAll('script').forEach(el => el.remove());
+
+  // Remove CSP meta tags — would block data: URIs and external resources
+  doc.querySelectorAll('meta[http-equiv]').forEach(el => {
+    if ((el.getAttribute('http-equiv') ?? '').toLowerCase() === 'content-security-policy') {
+      el.remove();
+    }
+  });
+
+  // Remove existing <base> tags
+  doc.querySelectorAll('base').forEach(el => el.remove());
+
+  // Inject <base href="{origin}/"> at top of <head> so remaining relative URLs resolve
+  const origin = new URL(baseUrl).origin;
+  const base = doc.createElement('base');
+  base.setAttribute('href', origin + '/');
+  doc.head.insertBefore(base, doc.head.firstChild);
+
+  // Rewrite src / href / srcset / action / data-src / poster to absolute
+  const attrTagMap: [string, string][] = [
+    ['src',      'img,script,iframe,video,audio,source,input,embed,track'],
+    ['href',     'a,link,area'],
+    ['action',   'form'],
+    ['data-src', 'img'],
+    ['poster',   'video'],
+  ];
+  for (const [attr, selector] of attrTagMap) {
+    doc.querySelectorAll(selector).forEach(el => {
+      const val = el.getAttribute(attr);
+      if (!val || val.startsWith('data:') || val.startsWith('blob:') || val.startsWith('#')) return;
+      try { el.setAttribute(attr, new URL(val, baseUrl).href); } catch { /* leave as-is */ }
+    });
+  }
+
+  // Rewrite srcset (comma-separated "url [descriptor]" pairs)
+  doc.querySelectorAll('[srcset]').forEach(el => {
+    const srcset = el.getAttribute('srcset');
+    if (!srcset) return;
+    el.setAttribute('srcset', srcset.split(',').map(part => {
+      const [url, ...rest] = part.trim().split(/\s+/);
+      try { return [new URL(url, baseUrl).href, ...rest].join(' '); } catch { return part; }
+    }).join(', '));
+  });
+
+  // Rewrite url() inside inline style attributes
+  doc.querySelectorAll('[style]').forEach(el => {
+    const style = el.getAttribute('style');
+    if (!style) return;
+    el.setAttribute('style', style.replace(/url\(['"]?([^'")\s]+)['"]?\)/g, (_, u) => {
+      if (u.startsWith('data:') || u.startsWith('blob:')) return `url('${u}')`;
+      try { return `url('${new URL(u, baseUrl).href}')`; } catch { return `url('${u}')`; }
+    }));
+  });
+
+  // Rewrite url() inside inline <style> blocks
+  doc.querySelectorAll('style').forEach(el => {
+    el.textContent = (el.textContent ?? '').replace(/url\(['"]?([^'")\s]+)['"]?\)/g, (_, u) => {
+      if (u.startsWith('data:') || u.startsWith('blob:')) return `url('${u}')`;
+      try { return `url('${new URL(u, baseUrl).href}')`; } catch { return `url('${u}')`; }
+    });
+  });
+
+  // Use outerHTML (HTML5 serialization) — NOT XMLSerializer which outputs XHTML
+  // and breaks void elements like <br/>, <input/> inside an HTML5 iframe
+  return '<!DOCTYPE html>' + doc.documentElement.outerHTML;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — inject creative into pre-processed HTML for a specific slot
+// Runs synchronously in ~10ms per slot. No network call.
+// ---------------------------------------------------------------------------
+function injectCreativeIntoHtml(
+  processedHtml: string,
+  slot: AdSlot,
+  dataUri: string,
+  mimeType: string,
+): { html: string } | { error: string } {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(processedHtml, 'text/html');
+
+  // Build the creative element
+  const creativeStyle = 'width:100%;height:100%;display:block;object-fit:contain;';
+  let creativeInner: string;
+  if (mimeType.startsWith('video/')) {
+    creativeInner = `<video src="${dataUri}" style="${creativeStyle}" autoplay muted loop playsinline></video>`;
+  } else if (mimeType === 'application/zip' || mimeType === 'application/x-zip-compressed') {
+    creativeInner = `<div style="${creativeStyle}background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span style="color:#6366f1;font-family:monospace;font-size:14px;font-weight:bold;">HTML5</span><span style="color:#94a3b8;font-family:monospace;font-size:11px;margin-top:4px;">Rich Media Ad</span></div>`;
+  } else {
+    creativeInner = `<img src="${dataUri}" alt="Ad Creative" style="${creativeStyle}" />`;
+  }
+  const badge = `<div style="position:absolute;bottom:4px;right:4px;background:#000;color:#fff;font-family:monospace;font-size:10px;padding:2px 6px;letter-spacing:0.1em;text-transform:uppercase;z-index:9999;">Your Ad</div>`;
+  const wrapped = `<div style="position:relative;width:${slot.width}px;height:${slot.height}px;overflow:hidden;outline:3px solid #000;flex-shrink:0;">${creativeInner}${badge}</div>`;
+
+  const slotStyle =
+    `position:relative;overflow:hidden;width:${slot.width}px;height:${slot.height}px;` +
+    `max-width:${slot.width}px;max-height:${slot.height}px;display:block;flex-shrink:0;`;
+
+  // Try recorded CSS selector + selectorIndex first
+  let target: Element | null = null;
+  if (slot.selector && slot.selector !== 'iab-dimension-match') {
+    try {
+      const matches = doc.querySelectorAll(slot.selector);
+      target = matches[slot.selectorIndex ?? 0] ?? matches[0] ?? null;
+    } catch { /* invalid selector */ }
+  }
+
+  // Fallback: find element with matching inline width/height style
+  if (!target) {
+    const candidates = doc.querySelectorAll('div,aside,section,ins');
+    for (const el of Array.from(candidates)) {
+      const s = el.getAttribute('style') ?? '';
+      const wm = s.match(/width\s*:\s*(\d+)px/);
+      const hm = s.match(/height\s*:\s*(\d+)px/);
+      if (wm && hm) {
+        if (Math.abs(parseInt(wm[1], 10) - slot.width) <= 12 &&
+            Math.abs(parseInt(hm[1], 10) - slot.height) <= 12) {
+          target = el;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!target) return { error: 'Could not locate the ad slot element in the page HTML.' };
+
+  (target as HTMLElement).setAttribute('style', slotStyle);
+  target.innerHTML = wrapped;
+
+  return { html: '<!DOCTYPE html>' + doc.documentElement.outerHTML };
+}
+
+// ---------------------------------------------------------------------------
+// DomIframeView — scaled iframe with auto-scroll to slot position
+// ---------------------------------------------------------------------------
 function DomIframeView({ html, slot, pageHeight }: {
   html: string;
   slot: AdSlot;
@@ -33,7 +162,7 @@ function DomIframeView({ html, slot, pageHeight }: {
 
   useEffect(() => {
     if (!containerRef.current) return;
-    const obs = new ResizeObserver((entries) => {
+    const obs = new ResizeObserver(entries => {
       const w = entries[0].contentRect.width;
       setContainerWidth(w);
       setScale(w / PAGE_RENDER_WIDTH);
@@ -42,19 +171,14 @@ function DomIframeView({ html, slot, pageHeight }: {
     return () => obs.disconnect();
   }, []);
 
-  // Auto-scroll to slot position once rendered
   useEffect(() => {
     if (!containerRef.current) return;
-    const scrollTarget = Math.max(0, (slot.y - 160) * scale);
-    containerRef.current.scrollTop = scrollTarget;
+    containerRef.current.scrollTop = Math.max(0, (slot.y - 160) * scale);
   }, [html, slot.y, scale]);
 
   return (
     <div ref={containerRef} className="flex-1 overflow-auto bg-[var(--surface-2)]">
-      <div
-        className="relative"
-        style={{ width: containerWidth, height: Math.max(pageHeight * scale, 400) }}
-      >
+      <div className="relative" style={{ width: containerWidth, height: Math.max(pageHeight * scale, 400) }}>
         <iframe
           srcDoc={html}
           title="DOM preview"
@@ -75,6 +199,9 @@ function DomIframeView({ html, slot, pageHeight }: {
   );
 }
 
+// ---------------------------------------------------------------------------
+// PreviewPanel
+// ---------------------------------------------------------------------------
 interface PreviewPanelProps {
   slot: AdSlot | null;
   creative: Creative | null;
@@ -85,13 +212,25 @@ interface PreviewPanelProps {
 
 export default function PreviewPanel({ slot, creative, detection, isOpen, onClose }: PreviewPanelProps) {
   const [activeTab, setActiveTab] = useState<ActiveTab>('screenshot');
+
+  // Screenshot tab state
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [isClosing, setIsClosing] = useState(false);
+
+  // DOM tab state
   const [domHtml, setDomHtml] = useState<string | null>(null);
-  const [isLoadingDom, setIsLoadingDom] = useState(false);
   const [domError, setDomError] = useState<string | null>(null);
+  const [isLoadingDom, setIsLoadingDom] = useState(false);
+
+  // Animation
+  const [isClosing, setIsClosing] = useState(false);
+
+  // Refs — hold cached data without triggering re-renders
+  const processedHtmlRef = useRef<string | null>(null);
+  const processedForUrlRef = useRef<string | null>(null); // tracks which detectedAt the cache is for
+  const creativeBase64Ref = useRef<{ fileId: string; b64: string } | null>(null);
+  const [creativeReady, setCreativeReady] = useState(false);
 
   // Close with animation
   const handleClose = () => {
@@ -114,7 +253,78 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
     return () => { document.body.style.overflow = ''; };
   }, [isOpen]);
 
-  // Load screenshot composite
+  // ---------------------------------------------------------------------------
+  // Effect 1 — pre-process page HTML once per detection session
+  // Keyed on detectedAt so a re-scan invalidates the cache.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!detection) return;
+    if (processedForUrlRef.current === detection.detectedAt) return; // already processed
+    processedHtmlRef.current = preprocessHtml(detection.pageHTML, detection.url);
+    processedForUrlRef.current = detection.detectedAt;
+  }, [detection?.detectedAt]);
+
+  // ---------------------------------------------------------------------------
+  // Effect 2 — fetch + cache creative base64 once per fileId
+  // Sets creativeReady=true to signal Effect 3 to run.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!creative) return;
+
+    // Cache hit — same creative already loaded
+    if (creativeBase64Ref.current?.fileId === creative.fileId) {
+      setCreativeReady(true);
+      return;
+    }
+
+    setCreativeReady(false);
+
+    fetch(creative.tempUrl)
+      .then(r => {
+        if (!r.ok) throw new Error('Could not load creative file.');
+        return r.blob();
+      })
+      .then(blob => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      }))
+      .then(b64 => {
+        creativeBase64Ref.current = { fileId: creative.fileId, b64 };
+        setCreativeReady(true);
+      })
+      .catch(() => setDomError('Could not load creative file.'));
+  }, [creative?.fileId]);
+
+  // ---------------------------------------------------------------------------
+  // Effect 3 — inject creative into pre-processed HTML per slot (synchronous)
+  // Only runs when DOM tab is active + creative is cached + HTML is pre-processed.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'dom') return;
+    if (!slot || !creative) return;
+    if (!creativeReady || !creativeBase64Ref.current) return;
+    if (!processedHtmlRef.current) return;
+
+    setDomError(null);
+    setDomHtml(null);
+    setIsLoadingDom(true);
+
+    const dataUri = `data:${creative.mimeType};base64,${creativeBase64Ref.current.b64}`;
+    const result = injectCreativeIntoHtml(processedHtmlRef.current, slot, dataUri, creative.mimeType);
+
+    if ('error' in result) {
+      setDomError(result.error);
+    } else {
+      setDomHtml(result.html);
+    }
+    setIsLoadingDom(false);
+  }, [isOpen, activeTab, slot?.id, creativeReady]);
+
+  // ---------------------------------------------------------------------------
+  // Screenshot effect — unchanged
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!isOpen || !slot || !creative || !detection) return;
     setPreview(null); setPreviewError(null); setIsLoadingPreview(true);
@@ -147,51 +357,6 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
       .catch(() => setPreviewError('Failed to generate preview.'))
       .finally(() => setIsLoadingPreview(false));
   }, [isOpen, slot?.id, creative?.fileId, detection?.url]);
-
-  // Load DOM-injected preview (lazy — only when DOM tab is active).
-  // Keyed on slot.id so switching slots always re-fetches. Reset + fetch happen
-  // atomically in one effect to avoid a blank-screen render between the two.
-  useEffect(() => {
-    if (!isOpen || activeTab !== 'dom' || !slot || !creative || !detection) return;
-    // Always start fresh for this slot
-    setDomHtml(null);
-    setDomError(null);
-    setIsLoadingDom(true);
-
-    let cancelled = false;
-
-    fetch(creative.tempUrl)
-      .then(r => {
-        if (!r.ok) throw new Error('Could not fetch creative file.');
-        return r.blob();
-      })
-      .then(blob => new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      }))
-      .then(creativeBase64 => gzipBase64(detection.pageHTML).then(pageHTMLGzip => fetch('/api/inject-creative', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pageHTMLGzip,
-          baseUrl: detection.url,
-          slot,
-          creativeBase64,
-          creativeMimeType: creative.mimeType,
-        }),
-      })))
-      .then(r => {
-        if (!r.ok) return r.json().then((d: { error?: string }) => { throw new Error(d.error ?? 'Injection failed'); });
-        return r.text();
-      })
-      .then(html => { if (!cancelled) setDomHtml(html); })
-      .catch(err => { if (!cancelled) setDomError(err instanceof Error ? err.message : 'DOM preview failed.'); })
-      .finally(() => { if (!cancelled) setIsLoadingDom(false); });
-
-    return () => { cancelled = true; };
-  }, [isOpen, activeTab, slot?.id, creative?.fileId, detection?.url]);
 
   if (!isOpen || !slot || !creative || !detection) return null;
 
@@ -310,7 +475,7 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
                   <p className="font-serif text-2xl text-black">DOM preview failed</p>
                   <p className="font-sans-ui text-base text-[var(--text-muted)]">{domError}</p>
                   <button
-                    onClick={() => { setDomHtml(null); setDomError(null); setIsLoadingDom(false); }}
+                    onClick={() => { setDomHtml(null); setDomError(null); }}
                     className="btn-primary"
                   >
                     Retry
