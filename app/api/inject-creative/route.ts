@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parse } from "node-html-parser";
+import { gunzipSync } from "zlib";
 import { AdSlot } from "@/types";
 
 export const maxDuration = 30;
 
 interface InjectRequest {
-  pageHTML: string;
+  pageHTMLGzip: string;  // gzip-compressed pageHTML, base64-encoded
   baseUrl: string;
   slot: AdSlot;
   creativeBase64: string;
@@ -126,20 +127,17 @@ function buildCreativeHtml(
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as InjectRequest;
-    const { pageHTML, baseUrl, slot, creativeBase64, creativeMimeType } = body;
+    const { pageHTMLGzip, baseUrl, slot, creativeBase64, creativeMimeType } = body;
 
-    if (
-      !pageHTML ||
-      !baseUrl ||
-      !slot ||
-      !creativeBase64 ||
-      !creativeMimeType
-    ) {
+    if (!pageHTMLGzip || !baseUrl || !slot || !creativeBase64 || !creativeMimeType) {
       return NextResponse.json(
         { error: "Missing required fields" },
         { status: 400 },
       );
     }
+
+    // Decompress pageHTML (sent as gzip+base64 to stay under Vercel's 4.5 MB body limit)
+    const pageHTML = gunzipSync(Buffer.from(pageHTMLGzip, "base64")).toString("utf8");
 
     // Parse HTML
     const root = parse(pageHTML, {

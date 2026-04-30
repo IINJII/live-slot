@@ -1,7 +1,22 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { strToU8, gzip } from 'fflate';
 import { AdSlot, Creative, DetectionResult, PreviewResult } from '@/types';
+
+// Gzip a string and return it as a base64-encoded string.
+// This keeps the inject-creative request body well under Vercel's 4.5 MB limit.
+function gzipBase64(str: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    gzip(strToU8(str), (err, compressed) => {
+      if (err) return reject(err);
+      // Convert Uint8Array → base64
+      let binary = '';
+      for (let i = 0; i < compressed.length; i++) binary += String.fromCharCode(compressed[i]);
+      resolve(btoa(binary));
+    });
+  });
+}
 
 const PAGE_RENDER_WIDTH = 1440;
 
@@ -156,17 +171,17 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
         reader.onerror = reject;
         reader.readAsDataURL(blob);
       }))
-      .then(creativeBase64 => fetch('/api/inject-creative', {
+      .then(creativeBase64 => gzipBase64(detection.pageHTML).then(pageHTMLGzip => fetch('/api/inject-creative', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          pageHTML: detection.pageHTML,
+          pageHTMLGzip,
           baseUrl: detection.url,
           slot,
           creativeBase64,
           creativeMimeType: creative.mimeType,
         }),
-      }))
+      })))
       .then(r => {
         if (!r.ok) return r.json().then((d: { error?: string }) => { throw new Error(d.error ?? 'Injection failed'); });
         return r.text();
