@@ -265,23 +265,26 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
   }, [detection?.detectedAt]);
 
   // ---------------------------------------------------------------------------
-  // Effect 2 — fetch + cache creative base64 once per fileId
-  // Sets creativeReady=true to signal Effect 3 to run.
+  // Effect 2 — fetch + cache creative base64
+  // Runs on every panel open (isOpen) so we always have a fresh fetch if the
+  // Vercel /tmp instance changed between upload and panel open.
+  // Cache hit (same fileId + already have b64) skips the network call.
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!creative) return;
+    if (!isOpen || !creative) return;
 
-    // Cache hit — same creative already loaded
+    // Cache hit — same creative already fetched this session
     if (creativeBase64Ref.current?.fileId === creative.fileId) {
       setCreativeReady(true);
       return;
     }
 
     setCreativeReady(false);
+    setDomError(null);
 
     fetch(creative.tempUrl)
       .then(r => {
-        if (!r.ok) throw new Error('Could not load creative file.');
+        if (!r.ok) throw new Error(`Could not load creative file (${r.status}).`);
         return r.blob();
       })
       .then(blob => new Promise<string>((resolve, reject) => {
@@ -294,8 +297,8 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
         creativeBase64Ref.current = { fileId: creative.fileId, b64 };
         setCreativeReady(true);
       })
-      .catch(() => setDomError('Could not load creative file.'));
-  }, [creative?.fileId]);
+      .catch(err => setDomError(err instanceof Error ? err.message : 'Could not load creative file.'));
+  }, [isOpen, creative?.fileId]);
 
   // ---------------------------------------------------------------------------
   // Effect 3 — inject creative into pre-processed HTML per slot (synchronous)
@@ -323,40 +326,32 @@ export default function PreviewPanel({ slot, creative, detection, isOpen, onClos
   }, [isOpen, activeTab, slot?.id, creativeReady]);
 
   // ---------------------------------------------------------------------------
-  // Screenshot effect — unchanged
+  // Screenshot effect — uses cached creative base64 from Effect 2
+  // Waits for creativeReady so it never races the fetch.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!isOpen || !slot || !creative || !detection) return;
+    if (!creativeReady || !creativeBase64Ref.current) return;
+
     setPreview(null); setPreviewError(null); setIsLoadingPreview(true);
 
-    fetch(creative.tempUrl)
-      .then(r => {
-        if (!r.ok) throw new Error('Could not fetch creative file.');
-        return r.blob();
-      })
-      .then(blob => new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      }))
-      .then(creativeBase64 => fetch('/api/screenshot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creativeBase64,
-          creativeMimeType: creative.mimeType,
-          slot,
-          screenshotBase64: detection.screenshotBase64,
-          pageWidth: detection.pageWidth,
-          pageHeight: detection.pageHeight,
-        }),
-      }))
+    fetch('/api/screenshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creativeBase64: creativeBase64Ref.current.b64,
+        creativeMimeType: creative.mimeType,
+        slot,
+        screenshotBase64: detection.screenshotBase64,
+        pageWidth: detection.pageWidth,
+        pageHeight: detection.pageHeight,
+      }),
+    })
       .then(r => r.json())
       .then(data => { if (data.error) setPreviewError(data.error); else setPreview(data); })
       .catch(() => setPreviewError('Failed to generate preview.'))
       .finally(() => setIsLoadingPreview(false));
-  }, [isOpen, slot?.id, creative?.fileId, detection?.url]);
+  }, [isOpen, slot?.id, creative?.fileId, detection?.url, creativeReady]);
 
   if (!isOpen || !slot || !creative || !detection) return null;
 
