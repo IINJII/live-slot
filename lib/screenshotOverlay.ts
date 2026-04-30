@@ -54,7 +54,7 @@ export async function compositeCreativeOnScreenshot({
   } else {
     // Resize image to fit the slot
     creativeResized = await sharp(creativeBuffer)
-      .resize(clampedW, clampedH, { fit: 'fill' })
+      .resize(clampedW, clampedH, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
       .png()
       .toBuffer();
   }
