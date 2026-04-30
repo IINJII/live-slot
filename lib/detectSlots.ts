@@ -64,6 +64,13 @@ export async function detectAdSlots(url: string): Promise<{
     // Wait for network to settle up to 5s, but don't block if it never fully idles
     await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(() => {});
 
+    // Dismiss consent/cookie/privacy dialogs before detecting slots
+    await dismissConsentDialog(page);
+
+    // Some consent banners load lazily — wait a beat and try again
+    await new Promise((r) => setTimeout(r, 800));
+    await dismissConsentDialog(page);
+
     // Get page dimensions
     const pageMetrics = await page.evaluate(() => ({
       width: document.documentElement.scrollWidth,
@@ -227,6 +234,80 @@ export async function detectAdSlots(url: string): Promise<{
     };
   } finally {
     if (browser) await browser.close();
+  }
+}
+
+async function dismissConsentDialog(page: import('puppeteer-core').Page): Promise<void> {
+  try {
+    const clicked = await page.evaluate(() => {
+      // ── Pass 1: button text scan ────────────────────────────────────────────
+      const ACCEPT_PATTERNS = [
+        /^i agree$/i, /^agree$/i,
+        /^accept all$/i, /^accept cookies$/i, /^accept all cookies$/i,
+        /^accept necessary$/i, /^accept$/i,
+        /^got it$/i, /^okay$/i, /^ok$/i,
+        /^consent$/i, /^continue$/i, /^confirm$/i,
+        /^allow all$/i, /^allow cookies$/i,
+      ];
+      const REJECT_PATTERNS = [
+        /^reject all$/i, /^reject$/i, /^decline$/i,
+        /^decline all$/i, /^no thanks$/i, /^manage preferences$/i,
+      ];
+
+      function isVisible(el: HTMLElement): boolean {
+        if (!el.offsetParent && el.tagName !== 'BODY') return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+      }
+
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a[role="button"], [role="button"]')
+      ).filter(isVisible);
+
+      // Try accept-group first
+      for (const pat of ACCEPT_PATTERNS) {
+        const el = candidates.find((b) => pat.test(b.innerText?.trim() ?? ''));
+        if (el) { el.click(); return true; }
+      }
+      // Fall back to reject-group
+      for (const pat of REJECT_PATTERNS) {
+        const el = candidates.find((b) => pat.test(b.innerText?.trim() ?? ''));
+        if (el) { el.click(); return true; }
+      }
+
+      // ── Pass 2: known consent-framework selectors ───────────────────────────
+      const SELECTORS = [
+        '#onetrust-accept-btn-handler',
+        '#CybotCookiebotDialogBodyButtonAccept',
+        '#didomi-notice-agree-button',
+        '#sp-cc-accept',
+        '.css-accept-btn',
+        '[class*="consent"] button[class*="accept"]',
+        '[class*="consent"] button[class*="agree"]',
+        '[class*="cookie"] button[class*="accept"]',
+        '[class*="cookie"] button[class*="agree"]',
+        '[id*="gdpr"] button',
+        '[class*="privacy-banner"] button',
+        '[aria-label*="agree" i]',
+        '[aria-label*="accept" i]',
+        '[aria-label*="consent" i]',
+      ];
+      for (const sel of SELECTORS) {
+        try {
+          const el = document.querySelector<HTMLElement>(sel);
+          if (el && isVisible(el)) { el.click(); return true; }
+        } catch { /* invalid selector */ }
+      }
+
+      return false;
+    });
+
+    // If something was clicked, wait for the dialog to animate out
+    if (clicked) {
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  } catch {
+    // Never block page processing due to dialog dismissal failure
   }
 }
 
