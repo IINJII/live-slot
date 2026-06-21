@@ -1,5 +1,6 @@
 // Known IAB standard ad sizes with friendly names
 export const IAB_SIZES: { width: number; height: number; name: string }[] = [
+  // Display banner sizes
   { width: 728, height: 90, name: 'Leaderboard' },
   { width: 300, height: 250, name: 'Medium Rectangle' },
   { width: 320, height: 50, name: 'Mobile Banner' },
@@ -31,21 +32,24 @@ export const AD_SELECTORS: string[] = [
   // Google Ad Manager / DFP
   'div[id^="div-gpt-ad"]',
   'div[id*="gpt-ad"]',
-  // Generic ad id/class patterns
-  'div[id*="ad-slot"]',
-  'div[id*="ad_slot"]',
-  'div[id*="-ad-"]',
-  'div[id*="_ad_"]',
-  'div[id^="ad-"]',
-  'div[id^="ad_"]',
-  'div[id$="-ad"]',
-  'div[id$="_ad"]',
-  'div[class*="ad-slot"]',
-  'div[class*="ad_slot"]',
-  'div[class*="adslot"]',
-  'div[class*="ad-unit"]',
-  'div[class*="ad_unit"]',
-  'div[class*="adunit"]',
+  // Generic ad id/class patterns — case-insensitive (` i` flag) because many
+  // publishers capitalize the token, e.g. GeeksforGeeks uses `GFG_AD_..._160x600`.
+  // Only the delimited tokens get the ` i` flag; a bare `ad` is too broad
+  // ("header", "gradient", "download", "thread" would all match).
+  'div[id*="ad-slot" i]',
+  'div[id*="ad_slot" i]',
+  'div[id*="-ad-" i]',
+  'div[id*="_ad_" i]',
+  'div[id^="ad-" i]',
+  'div[id^="ad_" i]',
+  'div[id$="-ad" i]',
+  'div[id$="_ad" i]',
+  'div[class*="ad-slot" i]',
+  'div[class*="ad_slot" i]',
+  'div[class*="adslot" i]',
+  'div[class*="ad-unit" i]',
+  'div[class*="ad_unit" i]',
+  'div[class*="adunit" i]',
   'div[class*="banner-ad"]',
   'div[class*="banner_ad"]',
   'div[class*="display-ad"]',
@@ -118,3 +122,32 @@ export function isIabSize(width: number, height: number): boolean {
       Math.abs(size.height - height) <= IAB_SIZE_TOLERANCE
   );
 }
+
+// Video AD-NETWORK iframe slots. A page-level <iframe> served from one of these
+// hosts is unambiguously a video ad placement (host = ad signal), so it can be
+// tagged video directly — no need to see inside the cross-origin frame.
+export const VIDEO_SELECTORS: string[] = [
+  'iframe[src*="imasdk.googleapis.com"]',
+  'iframe[src*="connatix.com"]',
+  'iframe[src*="teads.tv"]',
+  'iframe[src*="teads.com"]',
+  'iframe[src*="primis.tech"]',
+  'iframe[src*="primis.net"]',
+  'iframe[src*="sekindo.com"]',
+  'iframe[src*="aniview.com"]',
+  'iframe[src*="spotx.tv"]',
+  'iframe[src*="spotxchange.com"]',
+  'iframe[src*="brid.tv"]',
+  'iframe[src*="vidazoo.com"]',
+  'iframe[src*="vidible.tv"]',
+  'iframe[src*="unrulymedia.com"]',
+  'iframe[src*="springserve.com"]',
+  'iframe[src*="viralize.tv"]',
+];
+
+// An ancestor whose id/class matches this is an AD context. A bare <video> only
+// counts as a video AD slot when it sits under such an ancestor (strict mode):
+// video signal AND ad signal. 'video' is deliberately excluded from the pattern
+// so editorial "video-gallery"/"hero-video" wrappers do not match.
+export const AD_ANCESTOR_PATTERN =
+  'taboola|trc[_-]|tbl-|outbrain|ob[-_]widget|google_ads_iframe|googleactiveview|div-gpt-ad|gpt-ad|out-?stream|in-?stream|vpaid|vast|teads|spotx|connatix|cnx-|primis|sekindo|aniview|vidible|ad-?unit|ad-?slot|ad-?container|adsbygoogle|advertis';

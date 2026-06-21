@@ -24,6 +24,9 @@ export interface AdSlot {
   isVisible: boolean;
   isFixed: boolean; // position:fixed — viewport coords never change with scroll
   compositeBase64: string; // server-composited viewport screenshot with creative overlaid
+  slotType: 'display' | 'video'; // display = banner/image slot, video = video player container
+  slotOrigin?: 'footprint' | 'rescue' | 'box' | 'video'; // how the slot's size was derived
+  srcId?: string; // source element id (used to re-measure rescued slots at composite time)
 }
 
 export interface DetectionResult {

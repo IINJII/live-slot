@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Smartphone, Tablet, Monitor } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Creative, UploadResult } from "@/types";
+import FramePicker from "@/components/FramePicker";
 
 const ACCEPTED_MIME = [
   "image/jpeg",
@@ -14,7 +15,14 @@ const ACCEPTED_MIME = [
   "video/webm",
   "application/zip",
   "application/x-zip-compressed",
+  "text/html",
 ];
+
+// Extension fallback — browsers sometimes send an empty/odd MIME for .zip/.html.
+const ACCEPTED_EXTS = [".zip", ".html", ".htm"];
+
+const VAST_EXTS = [".vast", ".xml"];
+const VAST_MIMES = ["text/xml", "application/xml"];
 
 function formatBytes(b: number) {
   if (b < 1024) return `${b} B`;
@@ -36,6 +44,15 @@ export default function Home() {
   const [device, setDevice] = useState<"mobile" | "tablet" | "desktop">(
     "desktop",
   );
+  const [uploadMode, setUploadMode] = useState<"image" | "video" | "html">(
+    "image",
+  );
+  const [vastUrl, setVastUrl] = useState("");
+  const [framePicker, setFramePicker] = useState<{
+    src: string;
+    fileName: string;
+    fileId: string;
+  } | null>(null);
 
   // Pre-fill from sessionStorage on return
   useEffect(() => {
@@ -74,9 +91,45 @@ export default function Home() {
 
   const handleFile = useCallback(async (file: File) => {
     setUploadError(null);
-    if (!ACCEPTED_MIME.includes(file.type)) {
+
+    // VAST / XML — parse server-side to extract video URL
+    const isVast =
+      VAST_MIMES.includes(file.type) ||
+      VAST_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext));
+    if (isVast) {
+      setIsUploading(true);
+      try {
+        const vastXml = await file.text();
+        const res = await fetch("/api/parse-vast", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ vastXml }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setUploadError(data.error || "Failed to parse VAST");
+          return;
+        }
+        setFramePicker({
+          src: data.videoUrl,
+          fileName: data.fileName,
+          fileId: data.fileId,
+        });
+      } catch {
+        setUploadError("Failed to parse VAST file.");
+      } finally {
+        setIsUploading(false);
+      }
+      return;
+    }
+
+    const nameLower = file.name.toLowerCase();
+    if (
+      !ACCEPTED_MIME.includes(file.type) &&
+      !ACCEPTED_EXTS.some((ext) => nameLower.endsWith(ext))
+    ) {
       setUploadError(
-        "Unsupported format. Accepted: JPG PNG GIF WebP MP4 WebM ZIP",
+        "Unsupported format. Accepted: JPG PNG GIF WebP MP4 WebM ZIP HTML VAST",
       );
       return;
     }
@@ -84,6 +137,33 @@ export default function Home() {
       setUploadError("File exceeds 50 MB limit.");
       return;
     }
+
+    // Video — upload to server so FFmpeg can extract frames server-side
+    if (file.type === "video/mp4" || file.type === "video/webm") {
+      setIsUploading(true);
+      try {
+        const fd = new FormData();
+        fd.append("file", file);
+        const res = await fetch("/api/upload", { method: "POST", body: fd });
+        const data: UploadResult & { error?: string } = await res.json();
+        if (!res.ok || data.error) {
+          setUploadError(data.error ?? "Upload failed");
+          return;
+        }
+        setFramePicker({
+          src: data.tempUrl,
+          fileName: file.name,
+          fileId: data.fileId,
+        });
+      } catch {
+        setUploadError("Upload failed. Please try again.");
+      } finally {
+        setIsUploading(false);
+      }
+      return;
+    }
+
+    // Image / HTML5 ZIP — upload normally
     setIsUploading(true);
     try {
       const fd = new FormData();
@@ -94,7 +174,7 @@ export default function Home() {
         setUploadError(data.error ?? "Upload failed");
         return;
       }
-      const c: Creative = {
+      setCreative({
         fileId: data.fileId,
         fileName: data.fileName,
         fileType: data.fileType,
@@ -103,14 +183,82 @@ export default function Home() {
         height: data.height,
         tempUrl: data.tempUrl,
         size: data.size,
-      };
-      setCreative(c);
+      });
     } catch {
       setUploadError("Upload failed. Please try again.");
     } finally {
       setIsUploading(false);
     }
   }, []);
+
+  const handleVastFetch = useCallback(async () => {
+    if (!vastUrl) return;
+    setUploadError(null);
+    setIsUploading(true);
+    try {
+      const res = await fetch("/api/parse-vast", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: vastUrl }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setUploadError(data.error || "Failed to process VAST");
+        return;
+      }
+      setFramePicker({
+        src: data.videoUrl,
+        fileName: data.fileName,
+        fileId: data.fileId,
+      });
+    } catch {
+      setUploadError("Failed to fetch VAST. Check the URL and try again.");
+    } finally {
+      setIsUploading(false);
+    }
+  }, [vastUrl]);
+
+  const handleFrameSelected = useCallback(
+    async (blob: Blob, width: number, height: number) => {
+      const fp = framePicker;
+      setFramePicker(null);
+      setIsUploading(true);
+      try {
+        const frameName = (fp?.fileName ?? "frame").replace(
+          /\.(mp4|webm)$/i,
+          "-frame.jpg",
+        );
+        const fd = new FormData();
+        fd.append("file", blob, frameName);
+        const res = await fetch("/api/upload", { method: "POST", body: fd });
+        const data: UploadResult & { error?: string } = await res.json();
+        if (!res.ok || data.error) {
+          setUploadError(data.error ?? "Frame upload failed");
+          return;
+        }
+        setCreative({
+          fileId: data.fileId,
+          fileName: frameName,
+          fileType: "video",
+          mimeType: "image/jpeg",
+          width,
+          height,
+          tempUrl: data.tempUrl,
+          size: blob.size,
+        });
+      } catch {
+        setUploadError("Frame upload failed. Please try again.");
+      } finally {
+        setIsUploading(false);
+      }
+    },
+    [framePicker],
+  );
+
+  const handleFrameCancelled = useCallback(() => {
+    if (!framePicker) return;
+    setFramePicker(null);
+  }, [framePicker]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -224,19 +372,45 @@ export default function Home() {
               </p>
             </div>
 
+            {/* Mode tabs — only show when no creative selected */}
+            {!creative && (
+              <div className="flex border border-black mb-5">
+                {(["image", "video", "html"] as const).map((mode, i) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => {
+                      setUploadMode(mode);
+                      setUploadError(null);
+                    }}
+                    className={`cursor-pointer flex-1 py-2 font-mono text-xs tracking-widest uppercase transition-colors ${i > 0 ? "border-l border-black" : ""} ${
+                      uploadMode === mode
+                        ? "bg-black text-white"
+                        : "bg-white text-black hover:bg-[var(--surface-2)]"
+                    }`}
+                  >
+                    {mode === "image"
+                      ? "Image"
+                      : mode === "video"
+                        ? "Video"
+                        : "HTML"}
+                  </button>
+                ))}
+              </div>
+            )}
+
             {creative ? (
               <div className="animate-fade-in">
                 <div className="border border-[var(--line)] p-4 flex items-start gap-4 mb-4">
                   {/* Thumbnail */}
                   <div className="w-16 h-16 shrink-0 bg-[var(--surface-2)] border border-[var(--line)] overflow-hidden flex items-center justify-center">
-                    {creative.fileType === "image" ||
-                    creative.fileType === "gif" ? (
+                    {creative.mimeType.startsWith("image/") ? (
                       <img
                         src={creative.tempUrl}
                         alt=""
                         className="w-full h-full object-contain"
                       />
-                    ) : creative.fileType === "video" ? (
+                    ) : creative.mimeType.startsWith("video/") ? (
                       <video
                         src={creative.tempUrl}
                         className="w-full h-full object-contain"
@@ -291,7 +465,8 @@ export default function Home() {
                   <span>✓</span> Creative ready
                 </p>
               </div>
-            ) : (
+            ) : uploadMode === "image" ? (
+              /* Image dropzone */
               <div>
                 <div
                   onDragOver={(e) => {
@@ -337,10 +512,170 @@ export default function Home() {
                           Drop file here or click to browse
                         </p>
                         <p className="font-mono text-xs text-[var(--text-muted)] mt-2 tracking-wider uppercase">
-                          JPG · PNG · GIF · WebP · MP4 · HTML5 ZIP
+                          JPG · PNG · GIF · WebP
                         </p>
                         <p className="font-mono text-xs text-[var(--text-dim)] mt-1">
                           Max 50 MB
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </div>
+                {uploadError && (
+                  <p className="mt-3 font-mono text-sm text-red-600">
+                    {uploadError}
+                  </p>
+                )}
+              </div>
+            ) : uploadMode === "video" ? (
+              /* Video dropzone + VAST URL */
+              <div>
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  onClick={() => !isUploading && inputRef.current?.click()}
+                  className={`border-2 border-dashed cursor-pointer flex flex-col items-center justify-center gap-4 py-10 px-8 text-center transition-colors bg-[var(--surface-1)] ${
+                    isDragging
+                      ? "border-black bg-[var(--surface-2)]"
+                      : "border-black/30 hover:border-black hover:bg-[var(--surface-2)]"
+                  }`}
+                >
+                  {isUploading ? (
+                    <>
+                      <div
+                        className="w-8 h-8 border border-black border-t-transparent animate-spin"
+                        style={{ borderRadius: 0 }}
+                      />
+                      <span className="font-mono text-sm text-[var(--text-muted)] tracking-wider uppercase">
+                        Uploading…
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <svg
+                        className="w-8 h-8 text-[var(--text-muted)]"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={1}
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"
+                        />
+                      </svg>
+                      <div>
+                        <p className="font-sans-ui text-base text-black font-500">
+                          Drop file here or click to browse
+                        </p>
+                        <p className="font-mono text-xs text-[var(--text-muted)] mt-2 tracking-wider uppercase">
+                          MP4 · WebM · VAST · XML
+                        </p>
+                        <p className="font-mono text-xs text-[var(--text-dim)] mt-1">
+                          Max 50 MB
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* VAST URL secondary option */}
+                <div className="mt-4 border-t border-[var(--line)] pt-4">
+                  <p className="font-mono text-xs text-[var(--text-muted)] mb-2 tracking-wider uppercase">
+                    Or paste a VAST URL
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={vastUrl}
+                      onChange={(e) => setVastUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleVastFetch();
+                      }}
+                      placeholder="https://ad-server.com/vast?..."
+                      className="input-field flex-1"
+                      disabled={isUploading}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleVastFetch}
+                      disabled={!vastUrl || isUploading}
+                      className="btn-primary shrink-0"
+                    >
+                      {isUploading ? (
+                        <span
+                          className="w-4 h-4 border border-white border-t-transparent animate-spin"
+                          style={{ borderRadius: 0 }}
+                        />
+                      ) : (
+                        "Fetch →"
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {uploadError && (
+                  <p className="mt-3 font-mono text-sm text-red-600">
+                    {uploadError}
+                  </p>
+                )}
+              </div>
+            ) : (
+              /* HTML5 dropzone */
+              <div>
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  onClick={() => !isUploading && inputRef.current?.click()}
+                  className={`border-2 border-dashed cursor-pointer flex flex-col items-center justify-center gap-4 py-12 px-8 text-center transition-colors bg-[var(--surface-1)] ${
+                    isDragging
+                      ? "border-black bg-[var(--surface-2)]"
+                      : "border-black/30 hover:border-black hover:bg-[var(--surface-2)]"
+                  }`}
+                >
+                  {isUploading ? (
+                    <>
+                      <div
+                        className="w-8 h-8 border border-black border-t-transparent animate-spin"
+                        style={{ borderRadius: 0 }}
+                      />
+                      <span className="font-mono text-sm text-[var(--text-muted)] tracking-wider uppercase">
+                        Rendering…
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <svg
+                        className="w-8 h-8 text-[var(--text-muted)]"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={1}
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"
+                        />
+                      </svg>
+                      <div>
+                        <p className="font-sans-ui text-base text-black font-500">
+                          Drop HTML5 creative here or click to browse
+                        </p>
+                        <p className="font-mono text-xs text-[var(--text-muted)] mt-2 tracking-wider uppercase">
+                          ZIP · HTML
+                        </p>
+                        <p className="font-mono text-xs text-[var(--text-dim)] mt-1">
+                          Reads IAB ad.size · Max 50 MB
                         </p>
                       </div>
                     </>
@@ -356,7 +691,13 @@ export default function Home() {
             <input
               ref={inputRef}
               type="file"
-              accept=".jpg,.jpeg,.png,.webp,.gif,.mp4,.webm,.zip"
+              accept={
+                uploadMode === "image"
+                  ? ".jpg,.jpeg,.png,.webp,.gif"
+                  : uploadMode === "video"
+                    ? ".mp4,.webm,.vast,.xml"
+                    : ".zip,.html,.htm"
+              }
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (f) handleFile(f);
@@ -433,11 +774,6 @@ export default function Home() {
             </div>
 
             <div>
-              {!creative && (
-                <p className="font-mono text-sm text-[var(--text-muted)] mb-4">
-                  ← Upload a creative first
-                </p>
-              )}
               <button
                 onClick={handleDetect}
                 disabled={!canSubmit}
@@ -470,6 +806,17 @@ export default function Home() {
           Ad Creative Preview Platform
         </span>
       </footer>
+
+      {/* Frame picker overlay — shown when user uploads a video or fetches VAST */}
+      {framePicker && (
+        <FramePicker
+          videoSrc={framePicker.src}
+          fileName={framePicker.fileName}
+          fileId={framePicker.fileId}
+          onSelect={handleFrameSelected}
+          onCancel={handleFrameCancelled}
+        />
+      )}
     </div>
   );
 }

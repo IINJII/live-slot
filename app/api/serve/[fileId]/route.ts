@@ -32,10 +32,36 @@ export async function GET(
   const ext = getExtFromFileId(fileId);
   const mimeType = ext ? (EXT_TO_MIME[ext] ?? 'application/octet-stream') : 'application/octet-stream';
 
+  const totalSize = buffer.length;
+  const rangeHeader = request.headers.get('range');
+
+  // Byte-range support — required for HTML5 video seeking
+  if (rangeHeader) {
+    const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+    if (match) {
+      const start = parseInt(match[1], 10);
+      const end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+      const safeEnd = Math.min(end, totalSize - 1);
+      const chunk = buffer.slice(start, safeEnd + 1);
+      return new NextResponse(new Uint8Array(chunk), {
+        status: 206,
+        headers: {
+          'Content-Type': mimeType,
+          'Content-Range': `bytes ${start}-${safeEnd}/${totalSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(chunk.length),
+          'Cache-Control': 'private, max-age=3600',
+        },
+      });
+    }
+  }
+
   return new NextResponse(new Uint8Array(buffer), {
     status: 200,
     headers: {
       'Content-Type': mimeType,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': String(totalSize),
       'Cache-Control': 'private, max-age=3600',
     },
   });

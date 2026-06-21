@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { AdSlot, Creative, DetectionResult } from '@/types';
 import SlotGrid from '@/components/SlotGrid';
@@ -10,9 +10,20 @@ import { ScanningState, SlotGridSkeleton } from '@/components/LoadingSkeleton';
 type Step = 'scanning' | 'results' | 'error';
 
 const SLOT_TOLERANCE = 15;
+// Video slots are already gated to genuine video ad placements by slotType.
+// The aspect check only needs to keep orientation sane (don't drop a vertical
+// creative into a landscape slot); container rects are imprecise because the
+// scanner blocks media, so this tolerance is intentionally generous.
+const VIDEO_ASPECT_TOLERANCE = 0.35;
 
 function filterCompatibleSlots(slots: AdSlot[], creative: Creative | null): AdSlot[] {
   if (!creative || creative.width === 0 || creative.height === 0) return slots;
+  if (creative.fileType === 'video') {
+    const creativeRatio = creative.width / creative.height;
+    return slots.filter(
+      (s) => s.slotType === 'video' && Math.abs(s.width / s.height - creativeRatio) <= VIDEO_ASPECT_TOLERANCE
+    );
+  }
   return slots.filter(
     (s) =>
       Math.abs(s.width - creative.width) <= SLOT_TOLERANCE &&
@@ -24,9 +35,9 @@ function CreativeThumb({ creative }: { creative: Creative }) {
   return (
     <div className="flex items-center gap-3 border border-[var(--line)] px-4 py-2.5">
       <div className="w-10 h-10 shrink-0 border border-[var(--line)] bg-[var(--surface-2)] overflow-hidden flex items-center justify-center">
-        {(creative.fileType === 'image' || creative.fileType === 'gif') ? (
+        {creative.mimeType.startsWith('image/') ? (
           <img src={creative.tempUrl} alt="" className="w-full h-full object-contain" />
-        ) : creative.fileType === 'video' ? (
+        ) : creative.mimeType.startsWith('video/') ? (
           <video src={creative.tempUrl} className="w-full h-full object-contain" muted playsInline />
         ) : (
           <span className="font-mono text-[10px] text-[var(--text-muted)]">ZIP</span>
@@ -56,6 +67,9 @@ function ResultsPageInner() {
   const [creative, setCreative] = useState<Creative | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<AdSlot | null>(null);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
+  // Guards against duplicate detection requests — React StrictMode double-invokes
+  // effects in dev, and detection is an expensive (puppeteer) server call.
+  const detectKeyRef = useRef<string | null>(null);
 
   // Restore creative from sessionStorage
   useEffect(() => {
@@ -78,6 +92,11 @@ function ResultsPageInner() {
       setStep('error');
       return;
     }
+
+    // Skip the duplicate request StrictMode fires on the second effect run.
+    const detectKey = `${fileId}|${targetUrl}|${device}`;
+    if (detectKeyRef.current === detectKey) return;
+    detectKeyRef.current = detectKey;
 
     // Read creative dims directly from sessionStorage — creative state may not be set yet
     const creativeWidth = Number(sessionStorage.getItem('ls_width') ?? 0);

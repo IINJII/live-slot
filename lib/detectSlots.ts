@@ -2,14 +2,16 @@ import { AdSlot } from "@/types";
 import {
   AD_SELECTORS,
   getIabName,
+  isIabSize,
   IAB_SIZES,
   IAB_SIZE_TOLERANCE,
+  VIDEO_SELECTORS,
+  AD_ANCESTOR_PATTERN,
 } from "./adSelectors";
 import { v4 as uuidv4 } from "uuid";
-import puppeteer from "puppeteer-core";
-import chromium, { CHROMIUM_REMOTE_URL } from "./chromium";
 import sharp from "sharp";
 import * as fs from "fs";
+import { launchBrowser } from "./browser";
 import { getTmpFilePathById } from "./fileManager";
 
 export async function detectAdSlots(
@@ -28,37 +30,15 @@ export async function detectAdSlots(
   let browser = null;
 
   try {
-    const isVercel = !!process.env.VERCEL;
-    let executablePath: string;
-    let args: string[];
-
-    if (isVercel) {
-      executablePath = await chromium.executablePath(CHROMIUM_REMOTE_URL);
-      args = chromium.args;
-    } else {
-      const possiblePaths = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium-browser",
-        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-      ];
-      const found = possiblePaths.find((p) => fs.existsSync(p));
-      if (!found)
-        throw new Error(
-          "Chrome not found. Install Google Chrome for local development.",
-        );
-      executablePath = found;
-      args = ["--no-sandbox", "--disable-setuid-sandbox"];
-    }
-
-    browser = await puppeteer.launch({
-      args,
-      executablePath,
-      headless: true,
-    });
+    browser = await launchBrowser();
 
     const page = await browser.newPage();
+
+    // TEMP: forward in-page console.log (video-pass diagnostics) to server
+    page.on("console", (msg) => {
+      const t = msg.text();
+      if (t.startsWith("[video]")) console.log(t);
+    });
 
     // DPR=1 — ensures screenshot pixels = CSS pixels exactly
     await page.setViewport({
@@ -147,7 +127,10 @@ export async function detectAdSlots(
           selectors: string[],
           iabSizes: typeof IAB_SIZES,
           tolerance: number,
+          videoSelectors: string[],
+          adAncestorPattern: string,
         ) => {
+          const videoSelectorSet = new Set(videoSelectors);
           const seen = new Set<string>();
           const results: Array<{
             x: number;
@@ -158,6 +141,9 @@ export async function detectAdSlots(
             selectorIndex: number;
             isVisible: boolean;
             isFixed: boolean;
+            isVideoSlot: boolean;
+            slotOrigin: string;
+            srcId: string;
           }> = [];
 
           const selectorCount: Record<string, number> = {};
@@ -182,11 +168,125 @@ export async function detectAdSlots(
             return true;
           }
 
-          function processElement(el: Element, selector: string) {
+          // GAM/DFP slots often encode their booked size in the id, e.g.
+          // `GFG_AD_Desktop_RightSideBar_Docked_160x600`. Returns {dw,dh} when a
+          // plausible WxH token is present (used to rescue collapsed placeholders).
+          function parseDeclaredSize(
+            el: Element,
+          ): { dw: number; dh: number } | null {
+            const id = typeof el.id === "string" ? el.id : "";
+            const m = id.match(/[_-](\d{2,4})x(\d{2,4})(?:[_-]|$)/i);
+            if (!m) return null;
+            const dw = parseInt(m[1], 10);
+            const dh = parseInt(m[2], 10);
+            if (dw < 50 || dh < 50 || dw > 1200 || dh > 1200) return null;
+            return { dw, dh };
+          }
+
+          // Nearest IAB standard size within tolerance on BOTH axes (smallest
+          // combined delta), else null. Reuses the iabSizes + tolerance already
+          // passed into this evaluate(). Used to (a) detect when a rendered box
+          // is a clean standard fill and (b) snap near-standard boxes exact.
+          function nearestIab(w: number, h: number): { w: number; h: number } | null {
+            let best: { w: number; h: number } | null = null;
+            let bestDelta = Infinity;
+            for (const s of iabSizes) {
+              if (
+                Math.abs(s.width - w) <= tolerance &&
+                Math.abs(s.height - h) <= tolerance
+              ) {
+                const d = Math.abs(s.width - w) + Math.abs(s.height - h);
+                if (d < bestDelta) {
+                  bestDelta = d;
+                  best = { w: s.width, h: s.height };
+                }
+              }
+            }
+            return best;
+          }
+          const isCleanIab = (w: number, h: number): boolean =>
+            nearestIab(w, h) !== null;
+
+          // The actual rendered <iframe>/<video> inside an ad container is the
+          // TRUE ad footprint — neither the id label nor the wrapper box. A frame
+          // that self-identifies as an ad network frame is preferred over a larger
+          // generic embed (consent/social) sitting in the same container.
+          const AD_FRAME_RE =
+            /google_ads_iframe|doubleclick|googlesyndication|safeframe|adnxs|amazon-adsystem|gpt|ad[_-]?iframe|ad[_-]?frame/i;
+          function isAdFrame(n: Element): boolean {
+            const id = typeof n.id === "string" ? n.id : "";
+            const src =
+              (n.getAttribute && (n.getAttribute("src") || n.getAttribute("data-src"))) || "";
+            const nm = (n.getAttribute && n.getAttribute("name")) || "";
+            const cls = typeof (n as HTMLElement).className === "string"
+              ? (n as HTMLElement).className
+              : "";
+            return (
+              AD_FRAME_RE.test(id) ||
+              AD_FRAME_RE.test(src) ||
+              AD_FRAME_RE.test(nm) ||
+              AD_FRAME_RE.test(cls)
+            );
+          }
+
+          // Returns the largest qualifying rendered ad frame within `el` (or `el`
+          // itself when it IS an iframe/video) in viewport space, or null when the
+          // slot has not rendered an ad (collapsed/empty placeholder).
+          function findPrimaryAdRect(
+            el: Element,
+          ): { w: number; h: number; left: number; top: number } | null {
+            const MIN_W = 50;
+            const MIN_H = 40; // skips 1x1 tracking pixels AND thin label/feedback bars (h=20..22)
+            const vpArea = window.innerWidth * window.innerHeight;
+            const er = el.getBoundingClientRect();
+            const elArea = Math.max(0, er.width) * Math.max(0, er.height);
+            const cands: Element[] = [];
+            if (el.tagName === "IFRAME" || el.tagName === "VIDEO") cands.push(el);
+            el.querySelectorAll("iframe, video").forEach((n) => cands.push(n));
+
+            let best: { w: number; h: number; left: number; top: number } | null = null;
+            let bestArea = -1;
+            let bestIsAd = false;
+            for (const n of cands) {
+              const cs = window.getComputedStyle(n);
+              if (cs.display === "none" || cs.visibility === "hidden") continue;
+              const r = n.getBoundingClientRect();
+              const w = Math.round(r.width);
+              const h = Math.round(r.height);
+              if (w < MIN_W || h < MIN_H) continue;
+              const area = w * h;
+              if (area > 0.92 * vpArea) continue; // a full-page shell/anchor frame, not an ad unit
+              // Clip-box guard: only require the frame to sit inside el's box when el
+              // actually HAS a box. A collapsed/overflowing wrapper (300x0, 799x0)
+              // has near-zero area and cannot "contain" the frame — skip the test then.
+              if (n !== el && elArea >= MIN_W * MIN_H) {
+                const interW = Math.min(r.right, er.right) - Math.max(r.left, er.left);
+                const interH = Math.min(r.bottom, er.bottom) - Math.max(r.top, er.top);
+                if (interW <= 0 || interH <= 0) continue;
+                if ((interW * interH) / area < 0.5) continue; // frame spills mostly outside el
+              }
+              const isAd = isAdFrame(n);
+              if ((isAd && !bestIsAd) || (isAd === bestIsAd && area > bestArea)) {
+                bestArea = area;
+                bestIsAd = isAd;
+                best = { w, h, left: r.left, top: r.top };
+              }
+            }
+            return best;
+          }
+
+          function processElement(
+            el: Element,
+            selector: string,
+            isVideoSlot: boolean,
+          ) {
             const rect = el.getBoundingClientRect();
-            const w = rect.width;
-            const h = rect.height;
-            if (w < 50 || h < 30) return;
+            // Raw rendered box, captured BEFORE any canonicalization. A box below
+            // the min gate is "collapsed" — no live ad filled it during the scan.
+            const rw0 = Math.round(rect.width);
+            const rh0 = Math.round(rect.height);
+            const renderedReal = rw0 >= 50 && rh0 >= 30;
+            const declared = parseDeclaredSize(el);
 
             // Skip elements nested inside large fixed overlays (subscription popups,
             // interstitials). Requires z-index > 50 so we don't incorrectly skip
@@ -213,15 +313,82 @@ export async function detectAdSlots(
             const elStyle = window.getComputedStyle(el);
             const elIsFixed = elStyle.position === "fixed";
 
+            // ---- SIZE + ORIGIN resolution (inner-ad-footprint model) ----
+            // Trust order: FILLED (the real rendered iframe/video footprint outranks
+            // both the id label and the wrapper box) > BOOKED-BUT-EMPTY (id-declared
+            // rescue when nothing rendered + on-screen) > HEALTHY CLEAN-IAB BOX >
+            // DROP. canW/canH = reported size; cLeft/cTop = viewport-space origin.
+            const isDimMatch = selector === "iab-dimension-match";
+            // Dimension-scan candidates keep their own box (selected BY size) — never
+            // reshaped onto a child frame.
+            const ad = isDimMatch ? null : findPrimaryAdRect(el);
+            let canW: number, canH: number;
+            let cLeft = rect.left;
+            let cTop = rect.top;
+            let slotOrigin: "footprint" | "rescue" | "box" = "box";
+
+            if (ad) {
+              // FILLED: report the real ad footprint at the ad's OWN origin.
+              canW = ad.w;
+              canH = ad.h;
+              cLeft = ad.left;
+              cTop = ad.top;
+              slotOrigin = "footprint";
+              // Clean sub-pixel onto an exact standard size, keeping the ad CENTER
+              // fixed so the overlay never drifts. A true Custom (550x310/640x380)
+              // is left as-is, so a 300x250 creative cannot match it; a 300x600 fill
+              // snaps to Half Page.
+              const snap = nearestIab(canW, canH);
+              if (snap) {
+                const cx = ad.left + ad.w / 2;
+                const cy = ad.top + ad.h / 2;
+                canW = snap.w;
+                canH = snap.h;
+                cLeft = cx - canW / 2;
+                cTop = cy - canH / 2;
+              }
+            } else if (declared) {
+              // BOOKED-BUT-EMPTY: no rendered ad, but the id books a size. Rescue if
+              // on-screen (excludes off-canvas carousel slides parked far right).
+              const onScreen =
+                rect.left >= -20 &&
+                rect.top + window.scrollY >= 0 &&
+                rect.left + 50 <= window.innerWidth;
+              if (!onScreen) return;
+              canW = declared.dw;
+              canH = declared.dh;
+              const boxW = renderedReal ? rw0 : canW;
+              cLeft = rect.left + Math.max(0, Math.round((boxW - canW) / 2));
+              cTop = rect.top;
+              slotOrigin = "rescue";
+            } else {
+              // No inner ad, no booked size. Trust the box ONLY if it is a clean IAB
+              // fill — a large NON-IAB wrapper whose frame has not painted is dropped
+              // (the empty-wrapper timing-race false positive).
+              if (!renderedReal) return; // collapsed + unbooked + empty -> drop
+              if (!isDimMatch && isCleanIab(rw0, rh0)) {
+                const n = nearestIab(rw0, rh0)!;
+                canW = n.w;
+                canH = n.h;
+              } else if (isDimMatch) {
+                canW = rw0;
+                canH = rh0;
+              } else {
+                return; // oversized/odd non-IAB wrapper, no ad child, no id -> drop
+              }
+            }
+            canW = Math.round(canW);
+            canH = Math.round(canH);
+
             // For fixed elements, viewport coords ARE the absolute coords (scrollX/Y irrelevant)
             const absLeft = elIsFixed
-              ? Math.round(rect.left)
-              : Math.round(rect.left + window.scrollX);
+              ? Math.round(cLeft)
+              : Math.round(cLeft + window.scrollX);
             const absTop = elIsFixed
-              ? Math.round(rect.top)
-              : Math.round(rect.top + window.scrollY);
+              ? Math.round(cTop)
+              : Math.round(cTop + window.scrollY);
 
-            const key = `${absLeft}_${absTop}_${Math.round(w)}_${Math.round(h)}`;
+            const key = `${absLeft}_${absTop}_${canW}_${canH}`;
             if (seen.has(key)) return;
             seen.add(key);
 
@@ -231,22 +398,32 @@ export async function detectAdSlots(
             results.push({
               x: absLeft,
               y: absTop,
-              width: Math.round(w),
-              height: Math.round(h),
+              width: canW,
+              height: canH,
               selector,
               selectorIndex: idx,
               isVisible: isElementVisible(el),
               isFixed: elIsFixed,
+              isVideoSlot,
+              slotOrigin,
+              // Element id lets the composite step re-measure a rescued (collapsed)
+              // slot to verify it actually reserves space before drawing over it.
+              srcId: typeof el.id === "string" ? el.id : "",
             });
           }
 
-          const combined = selectors.join(",");
+          const allSelectors = [...selectors, ...videoSelectors];
+          const combined = allSelectors.join(",");
           try {
             document.querySelectorAll(combined).forEach((el) => {
-              for (const selector of selectors) {
+              for (const selector of allSelectors) {
                 try {
                   if (el.matches(selector)) {
-                    processElement(el, selector);
+                    processElement(
+                      el,
+                      selector,
+                      videoSelectorSet.has(selector),
+                    );
                     break;
                   }
                 } catch {
@@ -255,10 +432,10 @@ export async function detectAdSlots(
               }
             });
           } catch {
-            for (const selector of selectors) {
+            for (const selector of allSelectors) {
               try {
                 document.querySelectorAll(selector).forEach((el) => {
-                  processElement(el, selector);
+                  processElement(el, selector, videoSelectorSet.has(selector));
                 });
               } catch {
                 /* invalid selector, skip */
@@ -310,20 +487,196 @@ export async function detectAdSlots(
             const rect = el.getBoundingClientRect();
             const w = Math.round(rect.width);
             const hh = Math.round(rect.height);
-            const isIab = iabSizes.some(
+            const isDisplayIab = iabSizes.some(
               (s) =>
                 Math.abs(s.width - w) <= tolerance &&
                 Math.abs(s.height - hh) <= tolerance,
             );
-            if (isIab) processElement(el, "iab-dimension-match");
+            // The dimension scan is the weakest signal. Require BOTH visibility and
+            // a real rendered ad child (iframe/video) before emitting — an IAB-sized
+            // div with no ad inside is a false positive (e.g. an empty editorial
+            // card, or a hidden placeholder).
+            if (isDisplayIab && isElementVisible(el) && findPrimaryAdRect(el))
+              processElement(el, "iab-dimension-match", false);
           });
+
+          // ---- Native <video> ad-slot pass (STRICT: video signal AND ad signal) ----
+          // A bare <video> is only a video slot when it sits under an ad-network
+          // ancestor. We deep-walk open shadow roots and same-origin iframes because
+          // querySelectorAll does not pierce them. Because the scanner aborts
+          // resourceType==='media', the <video> itself often has no intrinsic size,
+          // so we size the slot from its nearest laid-out container.
+          const adAncestorRe = new RegExp(adAncestorPattern, "i");
+
+          function hasAdAncestor(el: Element): boolean {
+            let p: Element | null = el;
+            let depth = 0;
+            while (p && depth < 8 && p.tagName !== "BODY") {
+              const pid = typeof p.id === "string" ? p.id : "";
+              const pcls =
+                typeof (p as HTMLElement).className === "string"
+                  ? (p as HTMLElement).className
+                  : "";
+              if (adAncestorRe.test(pid) || adAncestorRe.test(pcls))
+                return true;
+              p = p.parentElement;
+              depth++;
+            }
+            return false;
+          }
+
+          // Editorial content players / decorative background heroes are NOT ad slots.
+          function isContentOrHeroVideo(v: HTMLVideoElement): boolean {
+            if (v.controls || v.loop) return true;
+            const win = v.ownerDocument.defaultView ?? window;
+            const s = win.getComputedStyle(v);
+            const r = v.getBoundingClientRect();
+            if (
+              s.objectFit === "cover" &&
+              (r.width >= win.innerWidth * 0.9 ||
+                r.height >= win.innerHeight * 0.6)
+            )
+              return true;
+            return false;
+          }
+
+          // Climb to the first sensibly-sized ancestor — the media-blocked <video>
+          // may be 0×0 or the 300×150 UA default.
+          function videoSlotRect(v: HTMLVideoElement): DOMRect {
+            let el: Element | null = v;
+            let depth = 0;
+            while (el && depth < 6) {
+              const r = el.getBoundingClientRect();
+              if (r.width >= 200 && r.height >= 80) return r;
+              el = el.parentElement;
+              depth++;
+            }
+            return v.getBoundingClientRect();
+          }
+
+          const videoHits: Array<{
+            video: HTMLVideoElement;
+            offX: number;
+            offY: number;
+          }> = [];
+
+          function collectVideos(
+            root: Document | ShadowRoot,
+            offX: number,
+            offY: number,
+          ) {
+            let nodes: NodeListOf<Element>;
+            try {
+              nodes = root.querySelectorAll("*");
+            } catch {
+              return;
+            }
+            for (const el of Array.from(nodes)) {
+              if (el.tagName === "VIDEO")
+                videoHits.push({ video: el as HTMLVideoElement, offX, offY });
+              // open shadow roots only — closed roots return null (blind spot).
+              // Shadow content shares the host's coordinate space → no offset.
+              const sr = (el as HTMLElement).shadowRoot;
+              if (sr) collectVideos(sr, offX, offY);
+              if (el.tagName === "IFRAME") {
+                let doc: Document | null = null;
+                try {
+                  doc = (el as HTMLIFrameElement).contentDocument;
+                } catch {
+                  doc = null; // cross-origin — unreadable
+                }
+                if (doc) {
+                  const ir = el.getBoundingClientRect();
+                  // child-frame coords are relative to the iframe's viewport;
+                  // add the iframe's top-viewport position (+ border) to map up.
+                  collectVideos(
+                    doc,
+                    offX + ir.left + (el as HTMLElement).clientLeft,
+                    offY + ir.top + (el as HTMLElement).clientTop,
+                  );
+                }
+              }
+            }
+          }
+          collectVideos(document, 0, 0);
+
+          // TEMP DIAGNOSTICS
+          const vidIframeCount = results.filter((r) => r.isVideoSlot).length;
+          console.log(
+            `[video] videoHits=${videoHits.length} videoNetworkIframes=${vidIframeCount}`,
+          );
+
+          for (const hit of videoHits) {
+            const v = hit.video;
+            const dr = v.getBoundingClientRect();
+            const cr = videoSlotRect(v);
+            const adAnc = hasAdAncestor(v);
+            const hero = isContentOrHeroVideo(v);
+            console.log(
+              `[video] <video> own=${Math.round(dr.width)}x${Math.round(dr.height)} container=${Math.round(cr.width)}x${Math.round(cr.height)} adAncestor=${adAnc} contentOrHero=${hero} controls=${v.controls} loop=${v.loop} cls="${(typeof v.className === "string" ? v.className : "").slice(0, 60)}"`,
+            );
+            if (isContentOrHeroVideo(v)) continue;
+            // STRICT: a bare <video> is only a video AD slot when it sits under an
+            // ad-network ancestor (out-stream unit). Content players are excluded
+            // even when the page loads IMA — pre-roll renders there but it is the
+            // publisher's player, not a dedicated ad placement.
+            if (!hasAdAncestor(v)) continue;
+            const r = videoSlotRect(v);
+            const w = Math.round(r.width);
+            const hh = Math.round(r.height);
+            if (w < 150 || hh < 60) continue; // relaxed video min-size
+            const win = v.ownerDocument.defaultView ?? window;
+            const elIsFixed = win.getComputedStyle(v).position === "fixed";
+            // r is in the element's frame viewport; offX/offY map to the TOP
+            // viewport; window.scrollX/Y (top doc) → absolute document coords.
+            const absLeft = Math.round(
+              r.left + hit.offX + (elIsFixed ? 0 : window.scrollX),
+            );
+            const absTop = Math.round(
+              r.top + hit.offY + (elIsFixed ? 0 : window.scrollY),
+            );
+            const key = `${absLeft}_${absTop}_${w}_${hh}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const idx = selectorCount["video-ad"] ?? 0;
+            selectorCount["video-ad"] = idx + 1;
+            results.push({
+              x: absLeft,
+              y: absTop,
+              width: w,
+              height: hh,
+              selector: "video-ad",
+              selectorIndex: idx,
+              isVisible: true,
+              isFixed: elIsFixed,
+              isVideoSlot: true,
+              slotOrigin: "video",
+              srcId: "",
+            });
+          }
 
           return results;
         },
         AD_SELECTORS,
         IAB_SIZES,
         IAB_SIZE_TOLERANCE,
-      );
+        VIDEO_SELECTORS,
+        AD_ANCESTOR_PATTERN,
+      ) as Promise<
+        Array<{
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          selector: string;
+          selectorIndex: number;
+          isVisible: boolean;
+          isFixed: boolean;
+          isVideoSlot: boolean;
+          slotOrigin: string;
+          srcId: string;
+        }>
+      >;
 
     let rawSlots = await runDetection();
     console.log(`[detectSlots] Fast pass: ${rawSlots.length} slots on ${url}`);
@@ -355,6 +708,9 @@ export async function detectAdSlots(
       isVisible: s.isVisible,
       isFixed: s.isFixed,
       compositeBase64: "",
+      slotType: s.isVideoSlot ? ("video" as const) : ("display" as const),
+      slotOrigin: s.slotOrigin as AdSlot["slotOrigin"],
+      srcId: s.srcId,
     }));
 
     // Deduplicate overlapping slots
@@ -382,7 +738,11 @@ export async function detectAdSlots(
       }
     }
 
-    // Per-slot: scroll to center slot in viewport → screenshot → composite
+    // Per-slot: scroll to center slot in viewport → screenshot → composite.
+    // Rescued (collapsed-at-detection) slots that still don't reserve space at
+    // composite time are collected here and dropped — drawing the creative there
+    // would land it over page content, not an ad box.
+    const dropIds = new Set<string>();
     for (const slot of deduped) {
       try {
         // Fixed elements (sticky banners, interstitials) stay at the same viewport
@@ -424,6 +784,102 @@ export async function detectAdSlots(
         let renderW = slot.width;
         let renderH = slot.height;
 
+        // Rescued slots booked a size but rendered no ad at detection. Re-measure
+        // the booked element now: if it reserves real space (filled or a sized
+        // reservation), anchor the creative inside it; if it is still collapsed,
+        // page content occupies that area, so DROP the slot rather than draw the
+        // creative over content.
+        if (slot.slotOrigin === "rescue") {
+          // The slot booked a size but had not filled at detection. Now that it is
+          // scrolled into view, give its (often lazy/viewability-gated) ad a real
+          // chance to load: wait for network idle, then a short paint dwell. Many
+          // below-fold GAM units only fill once visible — this converts a would-be
+          // drop into a clean filled slot.
+          await page
+            .waitForNetworkIdle({ idleTime: 700, timeout: 4000 })
+            .catch(() => {});
+          await new Promise((r) => setTimeout(r, 600));
+          // Re-measure: the rendered ad iframe/video if any, else the element box.
+          const m = slot.srcId
+            ? await page.evaluate((id: string) => {
+                const e = document.getElementById(id);
+                if (!e) return null;
+                let best: {
+                  left: number;
+                  top: number;
+                  width: number;
+                  height: number;
+                } | null = null;
+                let bestArea = -1;
+                const cands: Element[] = [e];
+                e.querySelectorAll("iframe, video").forEach((n) => cands.push(n));
+                for (const n of cands) {
+                  if (n.tagName !== "IFRAME" && n.tagName !== "VIDEO") continue;
+                  const r = n.getBoundingClientRect();
+                  if (r.width < 50 || r.height < 40) continue;
+                  const a = r.width * r.height;
+                  if (a > bestArea) {
+                    bestArea = a;
+                    best = {
+                      left: Math.round(r.left),
+                      top: Math.round(r.top),
+                      width: Math.round(r.width),
+                      height: Math.round(r.height),
+                    };
+                  }
+                }
+                const er = e.getBoundingClientRect();
+                return {
+                  ad: best, // the real rendered ad, if one painted
+                  box: {
+                    left: Math.round(er.left),
+                    top: Math.round(er.top),
+                    width: Math.round(er.width),
+                    height: Math.round(er.height),
+                  },
+                };
+              }, slot.srcId)
+            : null;
+
+          if (!m) {
+            dropIds.add(slot.id);
+            continue;
+          }
+          if (m.ad) {
+            // A real ad filled. Only composite if it is ~the booked size; if a
+            // LARGER ad served here, our smaller creative would not cover it
+            // (the original bleed bug) — drop instead.
+            if (
+              m.ad.width > slot.width + 30 ||
+              m.ad.height > slot.height + 30
+            ) {
+              dropIds.add(slot.id);
+              continue;
+            }
+            renderW = slot.width;
+            renderH = slot.height;
+            viewportX = Math.round(
+              m.ad.left + Math.max(0, (m.ad.width - slot.width) / 2),
+            );
+            viewportY = Math.round(
+              m.ad.top + Math.max(0, (m.ad.height - slot.height) / 2),
+            );
+          } else {
+            // No ad painted. Composite only if the element still reserves a real
+            // strip of space; a collapsed box means page content occupies the area.
+            if (m.box.height < slot.height * 0.6 || m.box.width < slot.width * 0.6) {
+              dropIds.add(slot.id);
+              continue;
+            }
+            renderW = slot.width;
+            renderH = slot.height;
+            viewportX = Math.round(
+              m.box.left + Math.max(0, (m.box.width - slot.width) / 2),
+            );
+            viewportY = m.box.top;
+          }
+        }
+
         // Re-measure element position AFTER scroll using proximity search.
         // We search by absolute coordinates instead of selectorIndex because:
         //   (a) new ad elements loading between detection and compositing shift
@@ -432,100 +888,119 @@ export async function detectAdSlots(
         // Tolerance is generous (120px) to handle content reflow (ads loading
         // can push elements well beyond a few pixels from their detected position).
         try {
-          const freshRect = await page.evaluate(
-            (
-              slotX: number,
-              slotY: number,
-              slotW: number,
-              slotH: number,
-              sx: number,
-              sy: number,
-            ): {
-              left: number;
-              top: number;
-              width: number;
-              height: number;
-            } | null => {
-              const DIST_TOLERANCE = 400; // px — large enough for infinite-scroll reflow
-              const SIZE_TOLERANCE = 30; // px — for the iab-dimension fallback pass
+          // Video slots (deep-walked <video> in shadow/iframe, or video-network
+          // iframes) cannot be reliably re-found by a flat top-document query.
+          // Rescued placeholders have NO rendered ad (still 0-height in the DOM),
+          // so a proximity re-measure could latch a different nearby filled iframe.
+          // Both trust the stored absolute coords instead.
+          const freshRect =
+            slot.slotType === "video" || slot.slotOrigin === "rescue"
+              ? null
+              : await page.evaluate(
+                  (
+                    slotX: number,
+                    slotY: number,
+                    slotW: number,
+                    slotH: number,
+                    sx: number,
+                    sy: number,
+                  ): {
+                    left: number;
+                    top: number;
+                    width: number;
+                    height: number;
+                  } | null => {
+                    const DIST_TOLERANCE = 400; // px — large enough for infinite-scroll reflow
+                    const SIZE_TOLERANCE = 30; // px — for the iab-dimension fallback pass
 
-              let best: {
-                left: number;
-                top: number;
-                width: number;
-                height: number;
-              } | null = null;
-              let bestScore = Infinity;
+                    let best: {
+                      left: number;
+                      top: number;
+                      width: number;
+                      height: number;
+                    } | null = null;
+                    let bestScore = Infinity;
 
-              function tryQuery(query: string, requireSizeMatch: boolean) {
-                let els: NodeListOf<HTMLElement>;
-                try {
-                  els = document.querySelectorAll<HTMLElement>(query);
-                } catch {
-                  return;
-                }
-                for (const el of Array.from(els)) {
-                  const r = el.getBoundingClientRect();
-                  if (r.width < 50 || r.height < 30) continue;
-                  const elFixed =
-                    window.getComputedStyle(el).position === "fixed";
-                  // Fixed elements' viewport coords don't shift with scroll
-                  const absX = Math.round(r.left + (elFixed ? 0 : sx));
-                  const absY = Math.round(r.top + (elFixed ? 0 : sy));
-                  const posDist =
-                    Math.abs(absX - slotX) + Math.abs(absY - slotY);
-                  if (posDist > DIST_TOLERANCE) continue;
-                  const wDiff = Math.abs(r.width - slotW);
-                  const hDiff = Math.abs(r.height - slotH);
-                  if (
-                    requireSizeMatch &&
-                    (wDiff > SIZE_TOLERANCE || hDiff > SIZE_TOLERANCE)
-                  )
-                    continue;
-                  // Score: position distance + half of size mismatch
-                  const score = posDist + (wDiff + hDiff) * 0.5;
-                  if (score < bestScore) {
-                    bestScore = score;
-                    best = {
-                      left: r.left,
-                      top: r.top,
-                      width: r.width,
-                      height: r.height,
-                    };
-                  }
-                }
-              }
+                    function tryQuery(
+                      query: string,
+                      requireSizeMatch: boolean,
+                    ) {
+                      let els: NodeListOf<HTMLElement>;
+                      try {
+                        els = document.querySelectorAll<HTMLElement>(query);
+                      } catch {
+                        return;
+                      }
+                      for (const el of Array.from(els)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 50 || r.height < 30) continue;
+                        const elFixed =
+                          window.getComputedStyle(el).position === "fixed";
+                        // Fixed elements' viewport coords don't shift with scroll
+                        const absX = Math.round(r.left + (elFixed ? 0 : sx));
+                        const absY = Math.round(r.top + (elFixed ? 0 : sy));
+                        const posDist =
+                          Math.abs(absX - slotX) + Math.abs(absY - slotY);
+                        if (posDist > DIST_TOLERANCE) continue;
+                        const wDiff = Math.abs(r.width - slotW);
+                        const hDiff = Math.abs(r.height - slotH);
+                        if (
+                          requireSizeMatch &&
+                          (wDiff > SIZE_TOLERANCE || hDiff > SIZE_TOLERANCE)
+                        )
+                          continue;
+                        // Score: position distance + half of size mismatch
+                        const score = posDist + (wDiff + hDiff) * 0.5;
+                        if (score < bestScore) {
+                          bestScore = score;
+                          best = {
+                            left: r.left,
+                            top: r.top,
+                            width: r.width,
+                            height: r.height,
+                          };
+                        }
+                      }
+                    }
 
-              // Pass 1: specific ad-network selectors (no size constraint needed)
-              tryQuery(
-                [
-                  "ins.adsbygoogle",
-                  'div[id^="div-gpt-ad"]',
-                  'div[id*="gpt-ad"]',
-                  'iframe[id*="google_ads_iframe"]',
-                  'iframe[src*="doubleclick"]',
-                  'iframe[src*="googlesyndication"]',
-                  "[data-ad-slot]",
-                  "[data-google-query-id]",
-                  "div[data-ad-unit]",
-                  "div[data-ad-id]",
-                  'div[class*="adsbygoogle"]',
-                ].join(","),
-                false,
-              );
+                    // Pass 0: the real ad IFRAME at the reported footprint size.
+                    // Reported slots now carry the inner-ad-footprint size+origin, so
+                    // a size-matched iframe near the stored coords is the actual ad —
+                    // this latches it before the unconstrained Pass 1 can grab an
+                    // oversized wrapper div.
+                    tryQuery("iframe", true);
 
-              // Pass 2: any iframe/div, but must match slot size (catches iab-dimension-match slots)
-              if (!best) tryQuery("iframe, div, aside", true);
+                    // Pass 1: specific ad-network selectors (no size constraint needed)
+                    if (!best)
+                      tryQuery(
+                        [
+                          "ins.adsbygoogle",
+                          'div[id^="div-gpt-ad"]',
+                          'div[id*="gpt-ad"]',
+                          'iframe[id*="google_ads_iframe"]',
+                          'iframe[src*="doubleclick"]',
+                          'iframe[src*="googlesyndication"]',
+                          "[data-ad-slot]",
+                          "[data-google-query-id]",
+                          "div[data-ad-unit]",
+                          "div[data-ad-id]",
+                          'div[class*="adsbygoogle"]',
+                        ].join(","),
+                        false,
+                      );
 
-              return best;
-            },
-            slot.x,
-            slot.y,
-            slot.width,
-            slot.height,
-            actualScroll.x,
-            actualScroll.y,
-          );
+                    // Pass 2: any iframe/div, but must match slot size (catches iab-dimension-match slots)
+                    if (!best) tryQuery("iframe, div, aside", true);
+
+                    return best;
+                  },
+                  slot.x,
+                  slot.y,
+                  slot.width,
+                  slot.height,
+                  actualScroll.x,
+                  actualScroll.y,
+                );
           if (freshRect && freshRect.width > 0 && freshRect.height > 0) {
             // Convert to absolute document coords using the scroll position at time of measurement
             const currentAbsX = freshRect.left + actualScroll.x;
@@ -559,6 +1034,19 @@ export async function detectAdSlots(
             viewportY = Math.round(currentAbsY - actualScroll.y);
             renderW = Math.round(freshRect.width);
             renderH = Math.round(freshRect.height);
+
+            // If the re-measure still latched the oversized responsive WRAPPER (e.g.
+            // a 799-wide in-content box) instead of the real ad iframe, the render
+            // box would be bigger than the reported footprint. Clamp to the footprint
+            // size and anchor on the STORED footprint origin (slot.x/slot.y) — NOT
+            // the re-found wrapper's center, which can be off by ~125px. CNN never
+            // trips this (footprint == rendered box there).
+            if (renderW > slot.width + 15 || renderH > slot.height + 15) {
+              renderW = slot.width;
+              renderH = slot.height;
+              viewportX = slot.x - actualScroll.x;
+              viewportY = slot.y - actualScroll.y;
+            }
           }
         } catch {
           // use coordinate math from actualScroll above
@@ -619,7 +1107,9 @@ export async function detectAdSlots(
     }));
 
     return {
-      slots: deduped,
+      // Drop rescued slots that turned out to reserve no real space (collapsed
+      // over page content) — they have no clean preview.
+      slots: deduped.filter((s) => !dropIds.has(s.id)),
       screenshotBase64,
       pageWidth: pageMetrics.width,
       pageHeight: pageMetrics.height,
@@ -826,6 +1316,10 @@ function deduplicateSlots(
   const result: AdSlot[] = [];
 
   for (const slot of slots) {
+    // Belt-and-suspenders: an invisible dimension-match should never be reported,
+    // mirroring the in-browser visibility gate on the dimension scan.
+    if (slot.selector === "iab-dimension-match" && !slot.isVisible) continue;
+
     const overlapping = result.findIndex((existing) => {
       const overlapX = Math.max(
         0,
@@ -849,6 +1343,14 @@ function deduplicateSlots(
     } else {
       const existing = result[overlapping];
 
+      // A video slot must never be collapsed into an overlapping display wrapper
+      // (or vice versa) — they target different creatives. The video one wins so
+      // it survives the downstream slotType==='video' filter.
+      if (slot.slotType !== existing.slotType) {
+        if (slot.slotType === "video") result[overlapping] = slot;
+        continue;
+      }
+
       if (hasCreative) {
         const slotDist =
           Math.abs(slot.width - creativeWidth) +
@@ -860,14 +1362,22 @@ function deduplicateSlots(
         continue;
       }
 
+      // No creative: prefer the higher-confidence slot. A strong-selector match
+      // beats a dimension-match; among equals, a clean standard (IAB) size beats a
+      // Custom one (so a canonicalized booked size wins over a leftover wrapper);
+      // only then fall back to larger area.
       const slotArea = slot.width * slot.height;
       const existingArea = existing.width * existing.height;
-      if (
-        (slot.selector !== "iab-dimension-match" &&
-          existing.selector === "iab-dimension-match") ||
-        slotArea > existingArea
-      ) {
+      const slotIsDim = slot.selector === "iab-dimension-match";
+      const existingIsDim = existing.selector === "iab-dimension-match";
+      const slotStd = isIabSize(slot.width, slot.height);
+      const existingStd = isIabSize(existing.width, existing.height);
+      if (existingIsDim && !slotIsDim) {
         result[overlapping] = slot;
+      } else if (!slotIsDim) {
+        if (slotStd && !existingStd) result[overlapping] = slot;
+        else if (slotStd === existingStd && slotArea > existingArea)
+          result[overlapping] = slot;
       }
     }
   }

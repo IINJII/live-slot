@@ -92,7 +92,7 @@ export default function PreviewPanel({
 
           {/* Creative info */}
           <div className="hidden lg:flex items-center gap-3 px-6 border-l border-[var(--line)]">
-            {(creative.fileType === "image" || creative.fileType === "gif") && (
+            {creative.mimeType.startsWith("image/") && (
               <div className="w-8 h-8 border border-[var(--line)] overflow-hidden bg-[var(--surface-2)] shrink-0">
                 <img src={creative.tempUrl} alt="" className="w-full h-full object-contain" />
               </div>

@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ['puppeteer-core', '@sparticuz/chromium', 'sharp'],
+  serverExternalPackages: ['puppeteer-core', '@sparticuz/chromium', 'sharp', 'ffmpeg-static'],
   turbopack: {
     root: __dirname,
   },
@@ -12,6 +12,7 @@ const nextConfig: NextConfig = {
         '@sparticuz/chromium',
         'puppeteer-core',
         'sharp',
+        'ffmpeg-static',
       ];
     }
     return config;
